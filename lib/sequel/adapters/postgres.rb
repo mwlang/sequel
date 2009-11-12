@@ -65,6 +65,11 @@ rescue LoadError => e
       unless defined?(CONNECTION_OK)
         CONNECTION_OK = -1
       end
+      unless method_defined?(:status)
+        def status
+          CONNECTION_OK
+        end
+      end
     end
     class PGresult 
       alias_method :nfields, :num_fields unless method_defined?(:nfields) 
@@ -79,6 +84,7 @@ rescue LoadError => e
 end
 
 module Sequel
+  Dataset::NON_SQL_OPTIONS << :cursor
   module Postgres
     CONVERTED_EXCEPTIONS << PGError
     
@@ -94,7 +100,7 @@ module Sequel
       [790, 1700] => lambda{|s| BigDecimal.new(s)}, # numeric
       [1082] => lambda{|s| @use_iso_date_format ? Date.new(*s.split("-").map{|x| x.to_i}) : Sequel.string_to_date(s)}, # date
       [1083, 1266] => lambda{|s| Sequel.string_to_time(s)}, # time
-      [1114, 1184] => lambda{|s| Sequel.string_to_datetime(s)}, # timestamp
+      [1114, 1184] => lambda{|s| Sequel.database_to_application_timestamp(s)}, # timestamp
     }
     PG_TYPE_PROCS.each do |k,v|
       k.each{|n| PG_TYPES[n] = v}
@@ -139,14 +145,14 @@ module Sequel
         q = nil
         begin
           q = args ? async_exec(sql, args) : async_exec(sql)
-        rescue PGError
+        rescue PGError => e
           begin
             s = status
           rescue PGError
-            raise(Sequel::DatabaseDisconnectError)
+            raise Sequel.convert_exception_class(e, Sequel::DatabaseDisconnectError)
           end
           status_ok = (s == Adapter::CONNECTION_OK)
-          status_ok ? raise : raise(Sequel::DatabaseDisconnectError)
+          status_ok ? raise : Sequel.convert_exception_class(e, Sequel::DatabaseDisconnectError)
         ensure
           block if status_ok
         end
@@ -299,22 +305,28 @@ module Sequel
       
       # Yield all rows returned by executing the given SQL and converting
       # the types.
-      def fetch_rows(sql)
-        cols = []
-        execute(sql) do |res|
-          res.nfields.times do |fieldnum|
-            cols << [fieldnum, PG_TYPES[res.ftype(fieldnum)], output_identifier(res.fname(fieldnum))]
-          end
-          @columns = cols.map{|c| c.at(2)}
-          res.ntuples.times do |recnum|
-            converted_rec = {}
-            cols.each do |fieldnum, type_proc, fieldsym|
-              value = res.getvalue(recnum, fieldnum)
-              converted_rec[fieldsym] = (value && type_proc) ? type_proc.call(value) : value
-            end
-            yield converted_rec
-          end
-        end
+      def fetch_rows(sql, &block)
+        return cursor_fetch_rows(sql, &block) if @opts[:cursor]
+        execute(sql){|res| yield_hash_rows(res, fetch_rows_set_cols(res), &block)}
+      end
+      
+      # Uses a cursor for fetching records, instead of fetching the entire result
+      # set at once.  Can be used to process large datasets without holding
+      # all rows in memory (which is what the underlying drivers do
+      # by default). Options:
+      #
+      # * :rows_per_fetch - the number of rows per fetch (default 1000).  Higher
+      #   numbers result in fewer queries but greater memory use.
+      #
+      # Usage:
+      #
+      #   DB[:huge_table].use_cursor.each{|row| p row}
+      #   DB[:huge_table].use_cursor(:rows_per_fetch=>10000).each{|row| p row}
+      #
+      # This is untested with the prepared statement/bound variable support,
+      # and unlikely to work with either.
+      def use_cursor(opts={})
+        clone(:cursor=>{:rows_per_fetch=>1000}.merge(opts))
       end
 
       if SEQUEL_POSTGRES_USES_PG
@@ -329,10 +341,9 @@ module Sequel
           
           protected
           
-          # Return an array of strings for each of the hash values, inserting
-          # them to the correct position in the array.
+          # An array of bound variable values for this query, in the correct order.
           def map_to_prepared_args(hash)
-            @prepared_args.map{|k| hash[k.to_sym].to_s}
+            prepared_args.map{|k| hash[k.to_sym]}
           end
 
           private
@@ -344,11 +355,11 @@ module Sequel
           # elminate ambiguity (and PostgreSQL from raising an exception).
           def prepared_arg(k)
             y, type = k.to_s.split("__")
-            if i = @prepared_args.index(y)
+            if i = prepared_args.index(y)
               i += 1
             else
-              @prepared_args << y
-              i = @prepared_args.length
+              prepared_args << y
+              i = prepared_args.length
             end
             LiteralString.new("#{prepared_arg_placeholder}#{i}#{"::#{type}" if type}")
           end
@@ -402,15 +413,15 @@ module Sequel
         end
         
         # Execute the given type of statement with the hash of values.
-        def call(type, hash, values=nil, &block)
+        def call(type, bind_vars={}, *values, &block)
           ps = to_prepared_statement(type, values)
           ps.extend(BindArgumentMethods)
-          ps.call(hash, &block)
+          ps.call(bind_vars, &block)
         end
         
         # Prepare the given type of statement with the given name, and store
         # it in the database to be called later.
-        def prepare(type, name=nil, values=nil)
+        def prepare(type, name=nil, *values)
           ps = to_prepared_statement(type, values)
           ps.extend(PreparedStatementMethods)
           if name
@@ -430,15 +441,68 @@ module Sequel
       end
       
       private
-
+      
+      # Use a cursor to fetch groups of records at a time, yielding them to the block.
+      def cursor_fetch_rows(sql, &block)
+        server_opts = {:server=>@opts[:server] || :read_only}
+        db.transaction(server_opts) do 
+          begin
+            execute_ddl("DECLARE sequel_cursor NO SCROLL CURSOR WITHOUT HOLD FOR #{sql}", server_opts)
+            rows_per_fetch = @opts[:cursor][:rows_per_fetch].to_i
+            rows_per_fetch = 1000 if rows_per_fetch <= 0
+            fetch_sql = "FETCH FORWARD #{rows_per_fetch} FROM sequel_cursor"
+            cols = nil
+            # Load columns only in the first fetch, so subsequent fetches are faster
+            execute(fetch_sql) do |res|
+              cols = fetch_rows_set_cols(res)
+              yield_hash_rows(res, cols, &block)
+              return if res.ntuples < rows_per_fetch
+            end
+            loop do
+              execute(fetch_sql) do |res|
+                yield_hash_rows(res, cols, &block)
+                return if res.ntuples < rows_per_fetch
+              end
+            end
+          ensure
+            execute_ddl("CLOSE sequel_cursor", server_opts)
+          end
+        end
+      end
+      
+      # Set the @columns based on the result set, and return the array of
+      # field numers, type conversion procs, and name symbol arrays.
+      def fetch_rows_set_cols(res)
+        cols = []
+        res.nfields.times do |fieldnum|
+          cols << [fieldnum, PG_TYPES[res.ftype(fieldnum)], output_identifier(res.fname(fieldnum))]
+        end
+        @columns = cols.map{|c| c.at(2)}
+        cols
+      end
+      
+      # Use the driver's escape_bytea
       def literal_blob(v)
         db.synchronize{|c| "'#{c.escape_bytea(v)}'"}
       end
-
+      
+      # Use the driver's escape_string
       def literal_string(v)
         db.synchronize{|c| "'#{c.escape_string(v)}'"}
       end
-
+      
+      # For each row in the result set, yield a hash with column name symbol
+      # keys and typecasted values.
+      def yield_hash_rows(res, cols)
+        res.ntuples.times do |recnum|
+          converted_rec = {}
+          cols.each do |fieldnum, type_proc, fieldsym|
+            value = res.getvalue(recnum, fieldnum)
+            converted_rec[fieldsym] = (value && type_proc) ? type_proc.call(value) : value
+          end
+          yield converted_rec
+        end
+      end
     end
   end
 end

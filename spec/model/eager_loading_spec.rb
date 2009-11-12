@@ -314,7 +314,7 @@ describe Sequel::Model, "#eager" do
     a = EagerBand.eager(:graph_members).all
     a.should == [EagerBand.load(:id=>2)]
     MODEL_DB.sqls.should == ['SELECT * FROM bands', 
-                             'SELECT members.id, bands.id AS bands_id, bands.p_k, bm.band_id AS x_foreign_key_x FROM members INNER JOIN bm ON ((bm.member_id = members.id) AND (bm.band_id IN (2))) LEFT OUTER JOIN bm AS bm_0 ON (bm_0.member_id = members.id) LEFT OUTER JOIN bands ON (bands.id = bm_0.band_id) ORDER BY bands.id']
+                             'SELECT members.id, bands.id AS bands_id, bands.p_k, bm.band_id AS x_foreign_key_x FROM (SELECT members.* FROM members INNER JOIN bm ON ((bm.member_id = members.id) AND (bm.band_id IN (2)))) AS members LEFT OUTER JOIN bm AS bm_0 ON (bm_0.member_id = members.id) LEFT OUTER JOIN bands ON (bands.id = bm_0.band_id) ORDER BY bands.id']
     a = a.first
     a.graph_members.should == [EagerBandMember.load(:id=>5)]
     a.graph_members.first.bands.should == [EagerBand.load(:id=>2, :p_k=>6), EagerBand.load(:id=>3, :p_k=>6)]
@@ -363,7 +363,7 @@ describe Sequel::Model, "#eager" do
     })
     a = EagerBand.load(:id=>2)
     a.graph_members.should == [EagerBandMember.load(:id=>5)]
-    MODEL_DB.sqls.should == ['SELECT members.id, bands.id AS bands_id, bands.p_k FROM members INNER JOIN bm ON ((bm.member_id = members.id) AND (bm.band_id = 2)) LEFT OUTER JOIN bm AS bm_0 ON (bm_0.member_id = members.id) LEFT OUTER JOIN bands ON (bands.id = bm_0.band_id) ORDER BY bands.id']
+    MODEL_DB.sqls.should == ['SELECT members.id, bands.id AS bands_id, bands.p_k FROM (SELECT members.* FROM members INNER JOIN bm ON ((bm.member_id = members.id) AND (bm.band_id = 2))) AS members LEFT OUTER JOIN bm AS bm_0 ON (bm_0.member_id = members.id) LEFT OUTER JOIN bands ON (bands.id = bm_0.band_id) ORDER BY bands.id']
     a.graph_members.first.bands.should == [EagerBand.load(:id=>2, :p_k=>6), EagerBand.load(:id=>3, :p_k=>6)]
     MODEL_DB.sqls.length.should == 1
   end
@@ -504,7 +504,50 @@ describe Sequel::Model, "#eager" do
     as.length.should == 1
     as.first.special_tracks.should == [EagerTrack.load(:album_id=>2, :id=>1)]
   end
+  
+  it "should respect the many_to_one association's composite keys" do
+    EagerAlbum.many_to_one :special_band, :class=>:EagerBand, :primary_key=>[:id, :p_k], :key=>[:band_id, :id]
+    EagerBand.dataset.extend(Module.new {
+      def fetch_rows(sql)
+        MODEL_DB.sqls << sql
+        yield({:p_k=>1, :id=>2})
+      end
+    })
+    as = EagerAlbum.eager(:special_band).all
+    MODEL_DB.sqls.should == ['SELECT * FROM albums', "SELECT * FROM bands WHERE ((bands.id, bands.p_k) IN ((2, 1)))"]
+    as.length.should == 1
+    as.first.special_band.should == EagerBand.load(:p_k=>1, :id=>2)
+  end
+  
+  it "should respect the one_to_many association's composite keys" do
+    EagerAlbum.one_to_many :special_tracks, :class=>:EagerTrack, :primary_key=>[:band_id, :id], :key=>[:id, :album_id]
+    EagerTrack.dataset.extend(Module.new {
+      def fetch_rows(sql)
+        MODEL_DB.sqls << sql
+        yield({:album_id=>1, :id=>2})
+      end
+    })
+    as = EagerAlbum.eager(:special_tracks).all
+    MODEL_DB.sqls.should == ['SELECT * FROM albums', "SELECT * FROM tracks WHERE ((tracks.id, tracks.album_id) IN ((2, 1)))"]
+    as.length.should == 1
+    as.first.special_tracks.should == [EagerTrack.load(:album_id=>1, :id=>2)]
+  end
 
+  it "should respect many_to_many association's composite keys" do
+    EagerAlbum.many_to_many :special_genres, :class=>:EagerGenre, :left_primary_key=>[:band_id, :id], :left_key=>[:l1, :l2], :right_primary_key=>[:xxx, :id], :right_key=>[:r1, :r2], :join_table=>:ag
+    EagerGenre.dataset.extend(Module.new {
+      def fetch_rows(sql)
+        MODEL_DB.sqls << sql
+        yield({:x_foreign_key_0_x=>2, :x_foreign_key_1_x=>1, :id=>5})
+        yield({:x_foreign_key_0_x=>2, :x_foreign_key_1_x=>1, :id=>6})
+      end
+    })
+    as = EagerAlbum.eager(:special_genres).all
+    MODEL_DB.sqls.should == ['SELECT * FROM albums', "SELECT genres.*, ag.l1 AS x_foreign_key_0_x, ag.l2 AS x_foreign_key_1_x FROM genres INNER JOIN ag ON ((ag.r1 = genres.xxx) AND (ag.r2 = genres.id) AND ((ag.l1, ag.l2) IN ((2, 1))))"]
+    as.length.should == 1
+    as.first.special_genres.should == [EagerGenre.load(:id=>5), EagerGenre.load(:id=>6)]
+  end
+  
   it "should respect many_to_many association's :left_primary_key and :right_primary_key options" do
     EagerAlbum.many_to_many :special_genres, :class=>:EagerGenre, :left_primary_key=>:band_id, :left_key=>:album_id, :right_primary_key=>:xxx, :right_key=>:genre_id, :join_table=>:ag
     EagerGenre.dataset.extend(Module.new {
@@ -567,6 +610,29 @@ describe Sequel::Model, "#eager" do
     a.al_tracks.should == [EagerTrack.load(:id=>6, :album_id=>1)]
     a.al_genres.should == [EagerGenre.load(:id=>8)]
   end
+  
+  it "should respect :uniq option when eagerly loading many_to_many associations" do
+    EagerAlbum.many_to_many :al_genres, :class=>'EagerGenre', :left_key=>:album_id, :right_key=>:genre_id, :join_table=>:ag, :uniq=>true
+    EagerGenre.dataset.extend(Module.new {
+      def fetch_rows(sql)
+        MODEL_DB.sqls << sql
+        yield({:x_foreign_key_x=>1, :id=>8})
+        yield({:x_foreign_key_x=>1, :id=>8})
+      end
+    })
+    a = EagerAlbum.eager(:al_genres).all.first
+    MODEL_DB.sqls.should == ['SELECT * FROM albums', "SELECT genres.*, ag.album_id AS x_foreign_key_x FROM genres INNER JOIN ag ON ((ag.genre_id = genres.id) AND (ag.album_id IN (1)))"]
+    a.should == EagerAlbum.load(:id => 1, :band_id => 2)
+    a.al_genres.should == [EagerGenre.load(:id=>8)]
+  end
+  
+  it "should respect :distinct option when eagerly loading many_to_many associations" do
+    EagerAlbum.many_to_many :al_genres, :class=>'EagerGenre', :left_key=>:album_id, :right_key=>:genre_id, :join_table=>:ag, :distinct=>true
+    a = EagerAlbum.eager(:al_genres).all.first
+    MODEL_DB.sqls.should == ['SELECT * FROM albums', "SELECT DISTINCT genres.*, ag.album_id AS x_foreign_key_x FROM genres INNER JOIN ag ON ((ag.genre_id = genres.id) AND (ag.album_id IN (1)))"]
+    a.should == EagerAlbum.load(:id => 1, :band_id => 2)
+    a.al_genres.should == [EagerGenre.load(:id=>4)]
+  end
 end
 
 describe Sequel::Model, "#eager_graph" do
@@ -626,6 +692,15 @@ describe Sequel::Model, "#eager_graph" do
     
   it "should raise an error if called without a symbol or hash" do
     proc{GraphAlbum.eager_graph(Object.new)}.should raise_error(Sequel::Error)
+  end
+
+  it "should not split results and assign associations if ungraphed is called" do
+    ds = GraphAlbum.eager_graph(:band).ungraphed
+    ds.sql.should == 'SELECT albums.id, albums.band_id, band.id AS band_id_0, band.vocalist_id FROM albums LEFT OUTER JOIN bands AS band ON (band.id = albums.band_id)'
+    def ds.fetch_rows(sql, &block)
+      yield({:id=>1, :band_id=>2, :band_id_0=>2, :vocalist_id=>3})
+    end
+    ds.all.should == [GraphAlbum.load(:id=>1, :band_id=>2, :band_id_0=>2, :vocalist_id=>3)]
   end
 
   it "should eagerly load a single many_to_one association" do
@@ -1049,6 +1124,43 @@ describe Sequel::Model, "#eager_graph" do
     as = ds.all
     as.should == [GraphAlbum.load(:id=>3, :band_id=>2)]
     as.first.right_tracks.should == [GraphTrack.load(:id=>5, :album_id=>2), GraphTrack.load(:id=>6, :album_id=>2)]
+  end
+  
+  it "should respect many_to_one association's composite keys" do 
+    GraphAlbum.many_to_one :inner_band, :class=>'GraphBand', :key=>[:band_id, :id], :primary_key=>[:vocalist_id, :id]
+    ds = GraphAlbum.eager_graph(:inner_band)
+    ds.sql.should == 'SELECT albums.id, albums.band_id, inner_band.id AS inner_band_id, inner_band.vocalist_id FROM albums LEFT OUTER JOIN bands AS inner_band ON ((inner_band.vocalist_id = albums.band_id) AND (inner_band.id = albums.id))'
+    def ds.fetch_rows(sql, &block)
+      yield({:id=>3, :band_id=>2, :inner_band_id=>3, :vocalist_id=>2})
+    end
+    as = ds.all
+    as.should == [GraphAlbum.load(:id=>3, :band_id=>2)]
+    as.first.inner_band.should == GraphBand.load(:id=>3, :vocalist_id=>2)
+  end
+
+  it "should respect one_to_many association's composite keys" do 
+    GraphAlbum.one_to_many :right_tracks, :class=>'GraphTrack', :key=>[:album_id, :id], :primary_key=>[:band_id, :id]
+    ds = GraphAlbum.eager_graph(:right_tracks)
+    ds.sql.should == 'SELECT albums.id, albums.band_id, right_tracks.id AS right_tracks_id, right_tracks.album_id FROM albums LEFT OUTER JOIN tracks AS right_tracks ON ((right_tracks.album_id = albums.band_id) AND (right_tracks.id = albums.id))'
+    def ds.fetch_rows(sql, &block)
+      yield({:id=>3, :band_id=>2, :right_tracks_id=>3, :album_id=>2})
+    end
+    as = ds.all
+    as.should == [GraphAlbum.load(:id=>3, :band_id=>2)]
+    as.first.right_tracks.should == [GraphTrack.load(:id=>3, :album_id=>2)]
+  end
+  
+  it "should respect many_to_many association's composite keys" do 
+    GraphAlbum.many_to_many :sbands, :class=>'GraphBand', :left_key=>[:l1, :l2], :left_primary_key=>[:band_id, :id], :right_key=>[:r1, :r2], :right_primary_key=>[:vocalist_id, :id], :join_table=>:b
+    ds = GraphAlbum.eager_graph(:sbands)
+    ds.sql.should == 'SELECT albums.id, albums.band_id, sbands.id AS sbands_id, sbands.vocalist_id FROM albums LEFT OUTER JOIN b ON ((b.l1 = albums.band_id) AND (b.l2 = albums.id)) LEFT OUTER JOIN bands AS sbands ON ((sbands.vocalist_id = b.r1) AND (sbands.id = b.r2))'
+    def ds.fetch_rows(sql, &block)
+      yield({:id=>3, :band_id=>2, :sbands_id=>5, :vocalist_id=>6})
+      yield({:id=>3, :band_id=>2, :sbands_id=>6, :vocalist_id=>22})
+    end
+    as = ds.all
+    as.should == [GraphAlbum.load(:id=>3, :band_id=>2)]
+    as.first.sbands.should == [GraphBand.load(:id=>5, :vocalist_id=>6), GraphBand.load(:id=>6, :vocalist_id=>22)]
   end
 
   it "should respect many_to_many association's :left_primary_key and :right_primary_key options" do 

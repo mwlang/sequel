@@ -11,7 +11,7 @@ class Sequel::ConnectionPool
   # The maximum number of connections.
   attr_reader :max_size
   
-  # The mutex that protects access to the other internal vairables.  You must use
+  # The mutex that protects access to the other internal variables.  You must use
   # this if you want to manipulate the variables safely.
   attr_reader :mutex
   
@@ -41,7 +41,8 @@ class Sequel::ConnectionPool
   #   present, will use a single :default server.  The server name symbol will
   #   be passed to the connection_proc.
   def initialize(opts = {}, &block)
-    @max_size = opts[:max_connections] || 4
+    @max_size = Integer(opts[:max_connections] || 4)
+    raise(Sequel::Error, ':max_connections must be positive') if @max_size < 1
     @mutex = Mutex.new
     @connection_proc = block
     @disconnection_proc = opts[:disconnection_proc]
@@ -53,8 +54,8 @@ class Sequel::ConnectionPool
       @available_connections[s] = []
       @allocated[s] = {}
     end
-    @timeout = opts[:pool_timeout] || 5
-    @sleep_time = opts[:pool_sleep_time] || 0.001
+    @timeout = Integer(opts[:pool_timeout] || 5)
+    @sleep_time = Float(opts[:pool_sleep_time] || 0.001)
     @convert_exceptions = opts.include?(:pool_convert_exceptions) ? opts[:pool_convert_exceptions] : true
   end
   
@@ -94,16 +95,19 @@ class Sequel::ConnectionPool
   def hold(server=:default)
     begin
       t = Thread.current
-      time = Time.new
-      timeout = time + @timeout
-      sleep_time = @sleep_time
       if conn = owned_connection(t, server)
         return yield(conn)
       end
       begin
-        until conn = acquire(t, server)
-          raise(::Sequel::PoolTimeout) if Time.new > timeout
+        unless conn = acquire(t, server)
+          time = Time.new
+          timeout = time + @timeout
+          sleep_time = @sleep_time
           sleep sleep_time
+          until conn = acquire(t, server)
+            raise(::Sequel::PoolTimeout) if Time.new > timeout
+            sleep sleep_time
+          end
         end
         yield conn
       rescue Sequel::DatabaseDisconnectError => dde
@@ -112,8 +116,8 @@ class Sequel::ConnectionPool
       ensure
         @mutex.synchronize{release(t, server)} if conn && !dde
       end
-    rescue StandardError => e
-      raise e
+    rescue StandardError 
+      raise
     rescue Exception => e
       raise(@convert_exceptions ? RuntimeError.new(e.message) : e)
     end
@@ -164,9 +168,7 @@ class Sequel::ConnectionPool
       begin
         conn = @connection_proc.call(server)
       rescue Exception=>exception
-        e = Sequel::DatabaseConnectionError.new("#{exception.class} #{exception.message}")
-        e.set_backtrace(exception.backtrace)
-        raise e
+        raise Sequel.convert_exception_class(exception, Sequel::DatabaseConnectionError)
       end
       raise(Sequel::DatabaseConnectionError, "Connection parameters not valid") unless conn
       conn
@@ -232,7 +234,7 @@ class Sequel::SingleThreadedPool
     begin
       begin
         yield(c = (@conns[server] ||= @connection_proc.call(server)))
-      rescue Sequel::DatabaseDisconnectError => dde
+      rescue Sequel::DatabaseDisconnectError
         @conns.delete(server)
         @disconnection_proc.call(c) if @disconnection_proc
         raise

@@ -17,7 +17,13 @@ module Sequel
   #     table_name # => :something
   #   end
   def self.Model(source)
-    Model::ANONYMOUS_MODEL_CLASSES[source] ||= Class.new(Model).set_dataset(source)
+    Model::ANONYMOUS_MODEL_CLASSES[source] ||= if source.is_a?(Database)
+      c = Class.new(Model)
+      c.db = source
+      c
+    else
+      Class.new(Model).set_dataset(source)
+    end
   end
 
   # Sequel::Model is an object relational mapper built on top of Sequel core.  Each
@@ -38,15 +44,15 @@ module Sequel
     ANONYMOUS_MODEL_CLASSES = {}
 
     # Class methods added to model that call the method of the same name on the dataset
-    DATASET_METHODS = %w'<< all avg count delete distinct eager eager_graph
-       each each_page empty? except exclude filter first from from_self
+    DATASET_METHODS = %w'<< add_graph_aliases all avg count delete distinct
+       each each_page eager eager_graph empty? except exclude filter first from from_self
        full_outer_join get graph grep group group_and_count group_by having import
-       inner_join insert insert_multiple intersect interval join join_table
-       last left_outer_join limit map multi_insert naked order order_by
-       order_more paginate print query range reverse_order right_outer_join
-       select select_all select_more server set set_graph_aliases 
-       single_value to_csv to_hash union unfiltered unordered 
-       update where with_sql'.map{|x| x.to_sym}
+       inner_join insert insert_multiple intersect interval invert join join_table
+       last left_outer_join limit map max min multi_insert naked order order_by
+       order_more paginate print qualify query range reverse reverse_order right_outer_join
+       select select_all select_more server set set_defaults set_graph_aliases set_overrides
+       single_value sum to_csv to_hash truncate unfiltered ungraphed ungrouped union unlimited unordered 
+       update where with with_recursive with_sql'.map{|x| x.to_sym}
   
     # Class instance variables to set to nil when a subclass is created, for -w compliance
     EMPTY_INSTANCE_VARIABLES = [:@overridable_methods_module, :@db]
@@ -102,7 +108,7 @@ module Sequel
     @use_transactions = true
   end
 
-  require %w"inflections plugins base exceptions errors", "model"
+  require %w"default_inflections inflections plugins base exceptions errors", "model"
   if !defined?(::SEQUEL_NO_ASSOCIATIONS) && !ENV.has_key?('SEQUEL_NO_ASSOCIATIONS')
     require 'associations', 'model'
     Model.plugin Model::Associations

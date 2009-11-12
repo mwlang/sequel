@@ -41,7 +41,7 @@ describe Sequel::Dataset, " graphing" do
     ds = @ds1.from_self.from_self.graph(@ds2.from_self.from_self, :x=>:id)
     ds.sql.should == 'SELECT t1.id, t1.x, t1.y, t2.id AS t2_id, t2.x AS t2_x, t2.y AS t2_y, t2.graph_id FROM (SELECT * FROM (SELECT * FROM points) AS t1) AS t1 LEFT OUTER JOIN (SELECT * FROM (SELECT * FROM (SELECT * FROM lines) AS t1) AS t1) AS t2 ON (t2.x = t1.id)'
     ds = @ds1.from(@ds1, @ds3).graph(@ds2.from_self, :x=>:id)
-    ds.sql.should == 'SELECT t1.id, t1.x, t1.y, t3.id AS t3_id, t3.x AS t3_x, t3.y AS t3_y, t3.graph_id FROM (SELECT * FROM points) AS t1, (SELECT * FROM graphs) AS t2 LEFT OUTER JOIN (SELECT * FROM (SELECT * FROM lines) AS t1) AS t3 ON (t3.x = t1.id)'
+    ds.sql.should == 'SELECT t1.id, t1.x, t1.y, t3.id AS t3_id, t3.x AS t3_x, t3.y AS t3_y, t3.graph_id FROM (SELECT * FROM (SELECT * FROM points) AS t1, (SELECT * FROM graphs) AS t2) AS t1 LEFT OUTER JOIN (SELECT * FROM (SELECT * FROM lines) AS t1) AS t3 ON (t3.x = t1.id)'
   end
 
   it "#graph should accept a symbol table name as the dataset" do
@@ -196,6 +196,14 @@ describe Sequel::Dataset, " graphing" do
     results = ds.all
     results.length.should == 1
     results.first.should == {:points=>{:id=>1, :x=>2, :y=>3}, :lines=>{:id=>4, :x=>5, :y=>6, :graph_id=>7}, :graph=>{:id=>8, :x=>9, :y=>10, :graph_id=>11}}
+  end
+
+  it "#ungraphed should remove the splitting of result sets into component tables" do
+    ds = @ds1.graph(@ds2, :x=>:id).ungraphed
+    def ds.fetch_rows(sql, &block)
+      yield({:id=>1,:x=>2,:y=>3,:lines_id=>4,:lines_x=>5,:lines_y=>6,:graph_id=>7})
+    end
+    ds.all.should == [{:id=>1,:x=>2,:y=>3,:lines_id=>4,:lines_x=>5,:lines_y=>6,:graph_id=>7}]
   end
 
   it "#graph_each should give a nil value instead of a hash when all values for a table are nil" do

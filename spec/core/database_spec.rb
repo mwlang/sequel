@@ -39,7 +39,15 @@ context "A new Database" do
   specify "should respect the :single_threaded option" do
     db = Sequel::Database.new(:single_threaded=>true)
     db.pool.should be_a_kind_of(Sequel::SingleThreadedPool)
+    db = Sequel::Database.new(:single_threaded=>'t')
+    db.pool.should be_a_kind_of(Sequel::SingleThreadedPool)
+    db = Sequel::Database.new(:single_threaded=>'1')
+    db.pool.should be_a_kind_of(Sequel::SingleThreadedPool)
     db = Sequel::Database.new(:single_threaded=>false)
+    db.pool.should be_a_kind_of(Sequel::ConnectionPool)
+    db = Sequel::Database.new(:single_threaded=>'f')
+    db.pool.should be_a_kind_of(Sequel::ConnectionPool)
+    db = Sequel::Database.new(:single_threaded=>'0')
     db.pool.should be_a_kind_of(Sequel::ConnectionPool)
   end
 
@@ -278,21 +286,30 @@ context "Database#execute" do
   end
 end
 
-context "Database#<<" do
+context "Database#<< and run" do
   before do
+    sqls = @sqls = []
     @c = Class.new(Sequel::Database) do
-      define_method(:execute) {|sql, opts| sql}
+      define_method(:execute_ddl){|sql, *opts| sqls.clear; sqls << sql; sqls.concat(opts)}
     end
     @db = @c.new({})
   end
   
-  specify "should pass the supplied sql to #execute" do
-    (@db << "DELETE FROM items").should == "DELETE FROM items"
+  specify "should pass the supplied sql to #execute_ddl" do
+    (@db << "DELETE FROM items")
+    @sqls.should == ["DELETE FROM items", {}]
+    @db.run("DELETE FROM items2")
+    @sqls.should == ["DELETE FROM items2", {}]
   end
   
-  specify "should not remove comments and whitespace from strings" do
-    s = "INSERT INTO items VALUES ('---abc')"
-    (@db << s).should == s
+  specify "should return nil" do
+    (@db << "DELETE FROM items").should == nil
+    @db.run("DELETE FROM items").should == nil
+  end
+  
+  specify "should accept options passed to execute_ddl" do
+    @db.run("DELETE FROM items", :server=>:s1)
+    @sqls.should == ["DELETE FROM items", {:server=>:s1}]
   end
 end
 
@@ -640,6 +657,106 @@ context "Database#transaction" do
   end
 end
 
+context "Database#transaction with savepoints" do
+  before do
+    @db = Dummy3Database.new
+    @db.meta_def(:supports_savepoints?){true}
+    @db.pool.connection_proc = proc {Dummy3Database::DummyConnection.new(@db)}
+  end
+  
+  specify "should wrap the supplied block with BEGIN + COMMIT statements" do
+    @db.transaction {@db.execute 'DROP TABLE test;'}
+    @db.sql.should == ['BEGIN', 'DROP TABLE test;', 'COMMIT']
+  end
+  
+  specify "should use savepoints if given the :savepoint option" do
+    @db.transaction{@db.transaction(:savepoint=>true){@db.execute 'DROP TABLE test;'}}
+    @db.sql.should == ['BEGIN', 'SAVEPOINT autopoint_1', 'DROP TABLE test;', 'RELEASE SAVEPOINT autopoint_1', 'COMMIT']
+  end
+  
+  specify "should not use a savepoints if no transaction is in progress" do
+    @db.transaction(:savepoint=>true){@db.execute 'DROP TABLE test;'}
+    @db.sql.should == ['BEGIN', 'DROP TABLE test;', 'COMMIT']
+  end
+  
+  specify "should reuse the current transaction if no :savepoint option is given" do
+    @db.transaction{@db.transaction{@db.execute 'DROP TABLE test;'}}
+    @db.sql.should == ['BEGIN', 'DROP TABLE test;', 'COMMIT']
+  end
+  
+  specify "should handle returning inside of the block by committing" do
+    def @db.ret_commit
+      transaction do
+        execute 'DROP TABLE test;'
+        return
+        execute 'DROP TABLE test2;';
+      end
+    end
+    @db.ret_commit
+    @db.sql.should == ['BEGIN', 'DROP TABLE test;', 'COMMIT']
+  end
+  
+  specify "should handle returning inside of a savepoint by committing" do
+    def @db.ret_commit
+      transaction do
+        transaction(:savepoint=>true) do
+          execute 'DROP TABLE test;'
+          return
+          execute 'DROP TABLE test2;';
+        end
+      end
+    end
+    @db.ret_commit
+    @db.sql.should == ['BEGIN', 'SAVEPOINT autopoint_1', 'DROP TABLE test;', 'RELEASE SAVEPOINT autopoint_1', 'COMMIT']
+  end
+  
+  specify "should issue ROLLBACK if an exception is raised, and re-raise" do
+    @db.transaction {@db.execute 'DROP TABLE test'; raise RuntimeError} rescue nil
+    @db.sql.should == ['BEGIN', 'DROP TABLE test', 'ROLLBACK']
+    
+    proc {@db.transaction {raise RuntimeError}}.should raise_error(RuntimeError)
+  end
+  
+  specify "should issue ROLLBACK SAVEPOINT if an exception is raised inside a savepoint, and re-raise" do
+    @db.transaction{@db.transaction(:savepoint=>true){@db.execute 'DROP TABLE test'; raise RuntimeError}} rescue nil
+    @db.sql.should == ['BEGIN', 'SAVEPOINT autopoint_1', 'DROP TABLE test', 'ROLLBACK TO SAVEPOINT autopoint_1', 'ROLLBACK']
+    
+    proc {@db.transaction {raise RuntimeError}}.should raise_error(RuntimeError)
+  end
+  
+  specify "should issue ROLLBACK if Sequel::Rollback is called in the transaction" do
+    @db.transaction do
+      @db.drop_table(:a)
+      raise Sequel::Rollback
+      @db.drop_table(:b)
+    end
+    
+    @db.sql.should == ['BEGIN', 'DROP TABLE a', 'ROLLBACK']
+  end
+  
+  specify "should issue ROLLBACK SAVEPOINT if Sequel::Rollback is called in a savepoint" do
+    @db.transaction do
+      @db.transaction(:savepoint=>true) do
+        @db.drop_table(:a)
+        raise Sequel::Rollback
+      end
+      @db.drop_table(:b)
+    end
+    
+    @db.sql.should == ['BEGIN', 'SAVEPOINT autopoint_1', 'DROP TABLE a', 'ROLLBACK TO SAVEPOINT autopoint_1', 'DROP TABLE b', 'COMMIT']
+  end
+  
+  specify "should raise database errors when commiting a transaction as Sequel::DatabaseError" do
+    @db.meta_def(:commit_transaction){raise ArgumentError}
+    lambda{@db.transaction{}}.should raise_error(ArgumentError)
+    lambda{@db.transaction{@db.transaction(:savepoint=>true){}}}.should raise_error(ArgumentError)
+
+    @db.meta_def(:database_error_classes){[ArgumentError]}
+    lambda{@db.transaction{}}.should raise_error(Sequel::DatabaseError)
+    lambda{@db.transaction{@db.transaction(:savepoint=>true){}}}.should raise_error(Sequel::DatabaseError)
+  end
+end
+
 context "A Database adapter with a scheme" do
   before do
     class CCC < Sequel::Database
@@ -731,13 +848,34 @@ context "A Database adapter with a scheme" do
   end
 
   specify "should be accessible through Sequel.connect with URL parameters" do
-    c = Sequel.connect 'ccc://localhost/db?host=/tmp&user=test'
+    c = Sequel.connect 'ccc:///db?host=/tmp&user=test'
     c.should be_a_kind_of(CCC)
     c.opts[:host].should == '/tmp'
     c.opts[:database].should == 'db'
     c.opts[:user].should == 'test'
   end
+  
+  specify "should have URL parameters take precedence over fixed URL parts" do
+    c = Sequel.connect 'ccc://localhost/db?host=a&database=b'
+    c.should be_a_kind_of(CCC)
+    c.opts[:host].should == 'a'
+    c.opts[:database].should == 'b'
+  end
+  
+  specify "should have hash options take predence over URL parameters or parts" do
+    c = Sequel.connect 'ccc://localhost/db?host=/tmp', :host=>'a', :database=>'b', :user=>'c'
+    c.should be_a_kind_of(CCC)
+    c.opts[:host].should == 'a'
+    c.opts[:database].should == 'b'
+    c.opts[:user].should == 'c'
+  end
 
+  specify "should unescape values of URL parameters and parts" do
+    c = Sequel.connect 'ccc:///d%5bb%5d?host=domain%5cinstance'
+    c.should be_a_kind_of(CCC)
+    c.opts[:database].should == 'd[b]'
+    c.opts[:host].should == 'domain\\instance'
+  end
 end
 
 context "Sequel::Database.connect" do
@@ -889,10 +1027,14 @@ context "Database#fetch" do
     @db.fetch('select * from xyz where x = ? and y = ?', 15, 'abc') {|r| sql = r[:sql]}
     sql.should == "select * from xyz where x = 15 and y = 'abc'"
     
-    # and Aman Gupta's example
-    @db.fetch('select name from table where name = ? or id in ?',
-    'aman', [3,4,7]) {|r| sql = r[:sql]}
+    @db.fetch('select name from table where name = ? or id in ?', 'aman', [3,4,7]) {|r| sql = r[:sql]}
     sql.should == "select name from table where name = 'aman' or id in (3, 4, 7)"
+  end
+  
+  specify "should format the given sql with named arguments" do
+    sql = nil
+    @db.fetch('select * from xyz where x = :x and y = :y', :x=>15, :y=>'abc') {|r| sql = r[:sql]}
+    sql.should == "select * from xyz where x = 15 and y = 'abc'"
   end
   
   specify "should return the dataset if no block is given" do
@@ -927,7 +1069,7 @@ context "Database#[]" do
     ds.opts[:from].should == [:items]
   end
   
-  specify "should return an enumerator when a string is given" do
+  specify "should return a dataset when a string is given" do
     c = Class.new(Sequel::Dataset) do
       def fetch_rows(sql); yield({:sql => sql}); end
     end
@@ -1113,6 +1255,7 @@ context "Database#typecast_value" do
   before do
     @db = Sequel::Database.new
   end
+
   specify "should raise an InvalidValue when given an invalid value" do
     proc{@db.typecast_value(:integer, "13a")}.should raise_error(Sequel::InvalidValue)
     proc{@db.typecast_value(:float, "4.e2")}.should raise_error(Sequel::InvalidValue)
@@ -1121,6 +1264,24 @@ context "Database#typecast_value" do
     proc{@db.typecast_value(:date, 'a')}.should raise_error(Sequel::InvalidValue)
     proc{@db.typecast_value(:time, Date.new)}.should raise_error(Sequel::InvalidValue)
     proc{@db.typecast_value(:datetime, 4)}.should raise_error(Sequel::InvalidValue)
+  end
+
+  specify "should have an underlying exception class available at wrapped_exception" do
+    begin
+      @db.typecast_value(:date, 'a')
+      true.should == false
+    rescue Sequel::InvalidValue => e
+      e.wrapped_exception.should be_a_kind_of(ArgumentError)
+    end
+  end
+
+  specify "should include underlying exception class in #inspect" do
+    begin
+      @db.typecast_value(:date, 'a')
+      true.should == false
+    rescue Sequel::InvalidValue => e
+      e.inspect.should =~ /\A#<Sequel::InvalidValue: ArgumentError: .*>\z/
+    end
   end
 end
 
@@ -1186,5 +1347,71 @@ context "Database#metadata_dataset" do
     ds = Sequel::Database.new.send(:metadata_dataset)
     ds.literal(:a).should == 'A'
     ds.send(:output_identifier, 'A').should == :a
+  end
+end
+
+context "Database#column_schema_to_ruby_default" do
+  specify "should handle converting many default formats" do
+    db = Sequel::Database.new
+    m = db.method(:column_schema_to_ruby_default)
+    p = lambda{|d,t| m.call(d,t)}
+    p[nil, :integer].should == nil
+    p['1', :integer].should == 1
+    p['-1', :integer].should == -1
+    p['1.0', :float].should == 1.0
+    p['-1.0', :float].should == -1.0
+    p['1.0', :decimal].should == BigDecimal.new('1.0')
+    p['-1.0', :decimal].should == BigDecimal.new('-1.0')
+    p['1', :boolean].should == true
+    p['0', :boolean].should == false
+    p['true', :boolean].should == true
+    p['false', :boolean].should == false
+    p["'t'", :boolean].should == true
+    p["'f'", :boolean].should == false
+    p["'a'", :string].should == 'a'
+    p["'a'", :blob].should == 'a'.to_sequel_blob
+    p["'a'", :blob].should be_a_kind_of(Sequel::SQL::Blob)
+    p["''", :string].should == ''
+    p["'\\a''b'", :string].should == "\\a'b"
+    p["'NULL'", :string].should == "NULL"
+    p["'2009-10-29'", :date].should == Date.new(2009,10,29)
+    p["CURRENT_TIMESTAMP", :date].should == nil
+    p["today()", :date].should == nil
+    p["'2009-10-29T10:20:30-07:00'", :datetime].should == DateTime.parse('2009-10-29T10:20:30-07:00')
+    p["'2009-10-29 10:20:30'", :datetime].should == DateTime.parse('2009-10-29 10:20:30')
+    p["'10:20:30'", :time].should == Time.parse('10:20:30')
+    p["NaN", :float].should == nil
+
+    db.meta_def(:database_type){:postgres}
+    p["''::text", :string].should == ""
+    p["'\\a''b'::character varying", :string].should == "\\a'b"
+    p["'a'::bpchar", :string].should == "a"
+    p["(-1)", :integer].should == -1
+    p["(-1.0)", :float].should == -1.0
+    p['(-1.0)', :decimal].should == BigDecimal.new('-1.0')
+    p["'a'::bytea", :blob].should == 'a'.to_sequel_blob
+    p["'a'::bytea", :blob].should be_a_kind_of(Sequel::SQL::Blob)
+    p["'2009-10-29'::date", :date].should == Date.new(2009,10,29)
+    p["'2009-10-29 10:20:30.241343'::timestamp without time zone", :datetime].should == DateTime.parse('2009-10-29 10:20:30.241343')
+    p["'10:20:30'::time without time zone", :time].should == Time.parse('10:20:30')
+
+    db.meta_def(:database_type){:mysql}
+    p["\\a'b", :string].should == "\\a'b"
+    p["a", :string].should == "a"
+    p["NULL", :string].should == "NULL"
+    p["-1", :float].should == -1.0
+    p['-1', :decimal].should == BigDecimal.new('-1.0')
+    p["2009-10-29", :date].should == Date.new(2009,10,29)
+    p["2009-10-29 10:20:30", :datetime].should == DateTime.parse('2009-10-29 10:20:30')
+    p["10:20:30", :time].should == Time.parse('10:20:30')
+    p["CURRENT_DATE", :date].should == nil
+    p["CURRENT_TIMESTAMP", :datetime].should == nil
+    p["a", :enum].should == "a"
+    
+    db.meta_def(:database_type){:mssql}
+    p["(N'a')", :string].should == "a"
+    p["((-12))", :integer].should == -12
+    p["((12.1))", :float].should == 12.1
+    p["((-12.1))", :decimal].should == BigDecimal.new('-12.1')
   end
 end

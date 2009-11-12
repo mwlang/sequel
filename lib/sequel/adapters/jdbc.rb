@@ -58,8 +58,8 @@ module Sequel
         Java::oracle.jdbc.driver.OracleDriver
       end,
       :sqlserver=>proc do |db|
-        Sequel.require 'adapters/shared/mssql'
-        db.extend(Sequel::MSSQL::DatabaseMethods)
+        Sequel.require 'adapters/jdbc/mssql'
+        db.extend(Sequel::JDBC::MSSQL::DatabaseMethods)
         com.microsoft.sqlserver.jdbc.SQLServerDriver
       end,
       :h2=>proc do |db|
@@ -88,12 +88,18 @@ module Sequel
       # The type of database we are connecting to
       attr_reader :database_type
       
+      # Whether to convert some Java types to ruby types when retrieving rows.
+      # True by default, can be set to false to roughly double performance when
+      # fetching rows.
+      attr_accessor :convert_types
+      
       # Call the DATABASE_SETUP proc directly after initialization,
       # so the object always uses sub adapter specific code.  Also,
       # raise an error immediately if the connection doesn't have a
       # uri, since JDBC requires one.
       def initialize(opts)
         @opts = opts
+        @convert_types = opts.include?(:convert_types) ? typecast_value_boolean(opts[:convert_types]) : true
         raise(Error, "No connection string specified") unless uri
         if match = /\Ajdbc:([^:]+)/.match(uri) and prok = DATABASE_SETUP[match[1].to_sym]
           prok.call(self)
@@ -134,7 +140,9 @@ module Sequel
       
       # Connect to the database using JavaSQL::DriverManager.getConnection.
       def connect(server)
-        setup_connection(JavaSQL::DriverManager.getConnection(uri(server_opts(server))))
+        args = [uri(server_opts(server))]
+        args.concat([opts[:user], opts[:password]]) if opts[:user] && opts[:password]
+        setup_connection(JavaSQL::DriverManager.getConnection(*args))
       end
       
       # Return instances of JDBC::Dataset with the given opts.
@@ -159,7 +167,7 @@ module Sequel
                 stmt.execute(sql)
               when :insert
                 stmt.executeUpdate(sql)
-                last_insert_id(conn, opts)
+                last_insert_id(conn, opts.merge(:stmt=>stmt))
               else
                 stmt.executeUpdate(sql)
               end
@@ -189,13 +197,18 @@ module Sequel
       # Values are subhashes with two keys, :columns and :unique.  The value of :columns
       # is an array of symbols of column names.  The value of :unique is true or false
       # depending on if the index is unique.
-      def indexes(table)
-        indexes = {}
+      def indexes(table, opts={})
         m = output_identifier_meth
-        metadata(:getIndexInfo, nil, nil, input_identifier_meth.call(table), false, true) do |r|
+        im = input_identifier_meth
+        schema, table = schema_and_table(table)
+        schema ||= opts[:schema]
+        schema = im.call(schema) if schema
+        table = im.call(table)
+        indexes = {}
+        metadata(:getIndexInfo, nil, schema, table, false, true) do |r|
           next unless name = r[:column_name]
           next if respond_to?(:primary_key_index_re, true) and r[:index_name] =~ primary_key_index_re 
-          i = indexes[m.call(r[:index_name])] ||= {:columns=>[], :unique=>!r[:non_unique]}
+          i = indexes[m.call(r[:index_name])] ||= {:columns=>[], :unique=>[false, 0].include?(r[:non_unique])}
           i[:columns] << m.call(name)
         end
         indexes
@@ -223,7 +236,7 @@ module Sequel
       
       # JDBC uses a statement object to execute SQL on the database
       def begin_transaction(conn)
-        conn = conn.createStatement
+        conn = conn.createStatement unless supports_savepoints?
         super
       end
       
@@ -277,7 +290,7 @@ module Sequel
                 cps.execute
               when :insert
                 cps.executeUpdate
-                last_insert_id(conn, opts)
+                last_insert_id(conn, opts.merge(:prepared=>true))
               else
                 cps.executeUpdate
               end
@@ -290,6 +303,14 @@ module Sequel
         end
       end
       
+      # Support fractional seconds for Time objects used in bound variables
+      def java_sql_timestamp(time)
+        millis = time.to_i * 1000
+        ts = java.sql.Timestamp.new(millis)
+        ts.setNanos(time.usec * 1000)
+        ts
+      end
+
       # By default, there is no support for determining the last inserted
       # id, so return nil.  This method should be overridden in
       # sub adapters.
@@ -304,7 +325,7 @@ module Sequel
       
       # Close the given statement when removing the transaction
       def remove_transaction(stmt)
-        stmt.close if stmt
+        stmt.close if stmt && !supports_savepoints?
         super
       end
       
@@ -316,16 +337,24 @@ module Sequel
         case arg
         when Integer
           cps.setInt(i, arg)
+        when Sequel::SQL::Blob
+          cps.setBytes(i, arg.to_java_bytes)
         when String
           cps.setString(i, arg)
         when Date, Java::JavaSql::Date
           cps.setDate(i, arg)
-        when Time, DateTime, Java::JavaSql::Timestamp
+        when DateTime, Java::JavaSql::Timestamp
           cps.setTimestamp(i, arg)
+        when Time
+          cps.setTimestamp(i, java_sql_timestamp(arg))
         when Float
           cps.setDouble(i, arg)
+        when TrueClass, FalseClass
+          cps.setBoolean(i, arg)
         when nil
           cps.setNull(i, JavaSQL::Types::NULL)
+        else
+          cps.setObject(i, arg)
         end
       end
       
@@ -340,12 +369,13 @@ module Sequel
         conn
       end
       
-      # All tables in this database
+      # Parse the table schema for the given table.
       def schema_parse_table(table, opts={})
         m = output_identifier_meth
         im = input_identifier_meth
         ds = dataset
         schema, table = schema_and_table(table)
+        schema ||= opts[:schema]
         schema = im.call(schema) if schema
         table = im.call(table)
         pks, ts = [], []
@@ -353,7 +383,7 @@ module Sequel
           pks << h[:column_name]
         end
         metadata(:getColumns, nil, schema, table, nil) do |h|
-          ts << [m.call(h[:column_name]), {:type=>schema_column_type(h[:type_name]), :db_type=>h[:type_name], :default=>(h[:column_def] == '' ? nil : h[:column_def]), :allow_null=>(h[:nullable] != 0), :primary_key=>pks.include?(h[:column_name])}]
+          ts << [m.call(h[:column_name]), {:type=>schema_column_type(h[:type_name]), :db_type=>h[:type_name], :default=>(h[:column_def] == '' ? nil : h[:column_def]), :allow_null=>(h[:nullable] != 0), :primary_key=>pks.include?(h[:column_name]), :column_size=>h[:column_size]}]
         end
         ts
       end
@@ -416,6 +446,17 @@ module Sequel
         end
       end
       
+      # Whether to convert some Java types to ruby types when retrieving rows.
+      # Uses the database's setting by default, can be set to false to roughly
+      # double performance when fetching rows.
+      attr_accessor :convert_types
+      
+      # Use the convert_types default setting from the database
+      def initialize(db, opts={})
+        @convert_types = db.convert_types
+        super
+      end
+      
       # Correctly return rows from the database and return them as hashes.
       def fetch_rows(sql, &block)
         execute(sql){|result| process_result_set(result, &block)}
@@ -424,7 +465,7 @@ module Sequel
       
       # Create a named prepared statement that is stored in the
       # database (and connection) for reuse.
-      def prepare(type, name=nil, values=nil)
+      def prepare(type, name=nil, *values)
         ps = to_prepared_statement(type, values)
         ps.extend(PreparedStatementMethods)
         if name
@@ -440,7 +481,7 @@ module Sequel
       def convert_type(v)
         case v
         when Java::JavaSQL::Timestamp, Java::JavaSQL::Time
-          Sequel.string_to_datetime(v.to_string)
+          Sequel.database_to_application_timestamp(v.to_string)
         when Java::JavaSQL::Date
           Sequel.string_to_date(v.to_string)
         when Java::JavaIo::BufferedReader
@@ -449,6 +490,8 @@ module Sequel
           lines.join("\n")
         when Java::JavaMath::BigDecimal
           BigDecimal.new(v.to_string)
+        when Java::byte[]
+          Sequel::SQL::Blob.new(String.from_java_bytes(v))
         else
           v
         end
@@ -468,10 +511,16 @@ module Sequel
         i = 0
         meta.getColumnCount.times{cols << [output_identifier(meta.getColumnLabel(i+=1)), i]}
         @columns = cols.map{|c| c.at(0)}
+        row = {}
+        blk = if @convert_types
+          lambda{|n, i| row[n] = convert_type(result.getObject(i))}
+        else
+          lambda{|n, i| row[n] = result.getObject(i)}
+        end
         # get rows
         while result.next
           row = {}
-          cols.each{|n, i| row[n] = convert_type(result.getObject(i))}
+          cols.each(&blk)
           yield row
         end
       end

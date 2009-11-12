@@ -15,12 +15,7 @@
 # object, which is closed (disconnected) when the block exits, just
 # like a block passed to connect.  For example:
 #
-#   Sequel.sqlite('blog.db'){|db| puts db[:users].count}  
-#
-# Sequel converts the column type tinyint to a boolean by default,
-# you can override the conversion to use tinyint as an integer:
-#
-#   Sequel.convert_tinyint_to_bool = false
+#   Sequel.sqlite('blog.db'){|db| puts db[:users].count} 
 #
 # Sequel converts two digit years in Dates and DateTimes by default,
 # so 01/02/03 is interpreted at January 2nd, 2003, and 12/13/99 is interpreted
@@ -34,16 +29,42 @@
 #
 #   Sequel.datetime_class = DateTime
 #
+# Sequel doesn't pay much attention to timezones by default, but you can set it
+# handle timezones if you want.  There are three separate timezone settings:
+#
+# * application_timezone - The timezone you want the application to use.  This is
+#   the timezone that incoming times from the database and typecasting are converted
+#   to.
+# * database_timezone - The timezone for storage in the database.  This is the
+#   timezone to which Sequel will convert timestamps before literalizing them
+#   for storage in the database.  It is also the timezone that Sequel will assume
+#   database timestamp values are already in (if they don't include an offset).
+# * typecast_timezone - The timezone that incoming data that Sequel needs to typecast
+#   is assumed to be already in (if they don't include an offset).
+#
+# You can set also set all three timezones to the same value at once via
+# Sequel.default_timezone=.
+#
+#   Sequel.application_timezone = :utc # or :local or nil
+#   Sequel.database_timezone = :utc # or :local or nil
+#   Sequel.typecast_timezone = :utc # or :local or nil
+#   Sequel.default_timezone = :utc # or :local or nil
+#
+# The only timezone values that are supported by default are :utc (convert to UTC),
+# :local (convert to local time), and nil (don't convert).  If you need to
+# convert to a specific timezone, or need the timezones being used to change based
+# on the environment (e.g. current user), you need to use an extension (and use
+# DateTime as the datetime_class).
+#
 # You can set the SEQUEL_NO_CORE_EXTENSIONS constant or environment variable to have
 # Sequel not extend the core classes.
 module Sequel
-  @convert_tinyint_to_bool = true
   @convert_two_digit_years = true
   @datetime_class = Time
   @virtual_row_instance_eval = true
   
   class << self
-    attr_accessor :convert_tinyint_to_bool, :convert_two_digit_years, :datetime_class, :virtual_row_instance_eval
+    attr_accessor :convert_two_digit_years, :datetime_class, :virtual_row_instance_eval
   end
 
   # Returns true if the passed object could be a specifier of conditions, false otherwise.
@@ -77,6 +98,26 @@ module Sequel
   #   Sequel.connect('sqlite://blog.db'){|db| puts db[:users].count}  
   def self.connect(*args, &block)
     Database.connect(*args, &block)
+  end
+  
+  # Convert the exception to the given class.  The given class should be
+  # Sequel::Error or a subclass.  Returns an instance of klass with
+  # the message and backtrace of exception.
+  def self.convert_exception_class(exception, klass)
+    return exception if exception.is_a?(klass)
+    e = klass.new("#{exception.class}: #{exception.message}")
+    e.wrapped_exception = exception
+    e.set_backtrace(exception.backtrace)
+    e
+  end
+
+  # Load all Sequel extensions given.  Only loads extensions included in this
+  # release of Sequel, doesn't load external extensions.
+  #
+  #   Sequel.extension(:schema_dumper)
+  #   Sequel.extension(:pagination, :query)
+  def self.extension(*extensions)
+    require(extensions, 'extensions')
   end
   
   # Set the method to call on identifiers going into the database.  This affects
@@ -118,15 +159,6 @@ module Sequel
     Database.quote_identifiers = value
   end
 
-  # Load all Sequel extensions given.  Only loads extensions included in this
-  # release of Sequel, doesn't load external extensions.
-  #
-  #   Sequel.extension(:schema_dumper)
-  #   Sequel.extension(:pagination, :query)
-  def self.extension(*extensions)
-    require(extensions, 'extensions')
-  end
-
   # Require all given files which should be in the same or a subdirectory of
   # this file.  If a subdir is given, assume all files are in that subdir.
   def self.require(files, subdir=nil)
@@ -148,7 +180,7 @@ module Sequel
     begin
       Date.parse(s, Sequel.convert_two_digit_years)
     rescue => e
-      raise InvalidValue, "Invalid Date value #{s.inspect} (#{e.message})"
+      raise convert_exception_class(e, InvalidValue)
     end
   end
 
@@ -162,7 +194,7 @@ module Sequel
         datetime_class.parse(s)
       end
     rescue => e
-      raise InvalidValue, "Invalid #{datetime_class} value #{s.inspect} (#{e.message})"
+      raise convert_exception_class(e, InvalidValue)
     end
   end
 
@@ -171,10 +203,24 @@ module Sequel
     begin
       Time.parse(s)
     rescue => e
-      raise InvalidValue, "Invalid Time value #{s.inspect} (#{e.message})"
+      raise convert_exception_class(e, InvalidValue)
     end
   end
 
+  # If the supplied block takes a single argument,
+  # yield a new SQL::VirtualRow instance to the block
+  # argument.  Otherwise, evaluate the block in the context of a new
+  # SQL::VirtualRow instance.
+  def self.virtual_row(&block)
+    vr = SQL::VirtualRow.new
+    case block.arity
+    when -1, 0
+      vr.instance_eval(&block)
+    else
+      block.call(vr)
+    end  
+  end
+  
   ### Private Class Methods ###
 
   # Helper method that the database adapter class methods that are added to Sequel via
@@ -195,15 +241,15 @@ module Sequel
   # Sequel.adapter_method.
   def self.def_adapter_method(*adapters) # :nodoc:
     adapters.each do |adapter|
-      instance_eval("def #{adapter}(*args, &block); adapter_method('#{adapter}', *args, &block) end")
+      instance_eval("def #{adapter}(*args, &block); adapter_method('#{adapter}', *args, &block) end", __FILE__, __LINE__)
     end
   end
 
   private_class_method :adapter_method, :def_adapter_method
   
-  require(%w"metaprogramming sql connection_pool exceptions dataset database version")
+  require(%w"metaprogramming sql connection_pool exceptions dataset database timezones version")
   require(%w"schema_generator schema_methods schema_sql", 'database')
-  require(%w"convenience graph prepared_statements sql", 'dataset')
+  require(%w"actions convenience features graph prepared_statements query sql", 'dataset')
   require('core_sql') if !defined?(::SEQUEL_NO_CORE_EXTENSIONS) && !ENV.has_key?('SEQUEL_NO_CORE_EXTENSIONS')
 
   # Add the database adapter class methods to Sequel via metaprogramming

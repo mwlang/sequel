@@ -1,6 +1,6 @@
-Sequel.require 'adapters/utils/savepoint_transactions'
-
 module Sequel
+  Dataset::NON_SQL_OPTIONS << :disable_insert_returning
+
   # Top level module for holding all PostgreSQL-related modules and classes
   # for Sequel.  There are a few module level accessors that are added via
   # metaprogramming.  These are:
@@ -165,13 +165,8 @@ module Sequel
     
     # Methods shared by Database instances that connect to PostgreSQL.
     module DatabaseMethods
-      include Sequel::Database::SavepointTransactions
-      
       PREPARED_ARG_PLACEHOLDER = LiteralString.new('$').freeze
       RE_CURRVAL_ERROR = /currval of sequence "(.*)" is not yet defined in this session|relation "(.*)" does not exist/.freeze
-      SQL_BEGIN = 'BEGIN'.freeze
-      SQL_COMMIT = 'COMMIT'.freeze
-      SQL_ROLLBACK = 'ROLLBACK'.freeze
       SYSTEM_TABLE_REGEXP = /^pg|sql/.freeze
 
       # Creates the function in the database.  Arguments:
@@ -277,16 +272,20 @@ module Sequel
         m = output_identifier_meth
         im = input_identifier_meth
         schema, table = schema_and_table(table)
+        range = 0...32
+        attnums = server_version >= 80100 ? SQL::Function.new(:ANY, :ind__indkey) : range.map{|x| SQL::Subscript.new(:ind__indkey, [x])}
         ds = metadata_dataset.
           from(:pg_class___tab).
           join(:pg_index___ind, :indrelid=>:oid, im.call(table)=>:relname).
           join(:pg_class___indc, :oid=>:indexrelid).
-          join(:pg_attribute___att, :attrelid=>:tab__oid, :attnum=>SQL::Function.new(:ANY, :ind__indkey)).
-          filter(:indc__relkind=>'i', :ind__indisprimary=>false, :indexprs=>nil, :indpred=>nil, :indisvalid=>true, :indisready=>true, :indcheckxmin=>false).
-          order(:indc__relname, (0...32).map{|x| [SQL::Subscript.new(:ind__indkey, [x]), x]}.case(32, :att__attnum)).
+          join(:pg_attribute___att, :attrelid=>:tab__oid, :attnum=>attnums).
+          filter(:indc__relkind=>'i', :ind__indisprimary=>false, :indexprs=>nil, :indpred=>nil).
+          order(:indc__relname, range.map{|x| [SQL::Subscript.new(:ind__indkey, [x]), x]}.case(32, :att__attnum)).
           select(:indc__relname___name, :ind__indisunique___unique, :att__attname___column)
         
         ds.join!(:pg_namespace___nsp, :oid=>:tab__relnamespace, :nspname=>schema.to_s) if schema
+        ds.filter!(:indisvalid=>true) if server_version >= 80200
+        ds.filter!(:indisready=>true, :indcheckxmin=>false) if server_version >= 80300
         
         indexes = {}
         ds.each do |r|
@@ -346,12 +345,17 @@ module Sequel
           (conn.server_version rescue nil) if conn.respond_to?(:server_version)
         end
         unless @server_version
-          m = /PostgreSQL (\d+)\.(\d+)\.(\d+)/.match(get(SQL::Function.new(:version)))
+          m = /PostgreSQL (\d+)\.(\d+)(?:(?:rc\d+)|\.(\d+))?/.match(fetch('SELECT version()').single_value)
           @server_version = (m[1].to_i * 10000) + (m[2].to_i * 100) + m[3].to_i
         end
         @server_version
       end
       
+      # PostgreSQL supports savepoints
+      def supports_savepoints?
+        true
+      end
+
       # Whether the given table exists in the database
       #
       # Options:
@@ -451,7 +455,11 @@ module Sequel
       def index_definition_sql(table_name, index)
         cols = index[:columns]
         index_name = index[:name] || default_index_name(table_name, cols)
-        expr = literal(Array(cols))
+        expr = if o = index[:opclass] 
+          "(#{Array(cols).map{|c| "#{literal(c)} #{o}"}.join(', ')})"
+        else
+          literal(Array(cols))
+        end
         unique = "UNIQUE " if index[:unique]
         index_type = index[:type]
         filter = index[:where] || index[:filter]
@@ -581,10 +589,12 @@ module Sequel
       QUERY_PLAN = 'QUERY PLAN'.to_sym
       ROW_EXCLUSIVE = 'ROW EXCLUSIVE'.freeze
       ROW_SHARE = 'ROW SHARE'.freeze
-      SELECT_CLAUSE_ORDER = %w'distinct columns from join where group having compounds order limit lock'.freeze
+      SELECT_CLAUSE_METHODS = Dataset.clause_methods(:select, %w'distinct columns from join where group having compounds order limit lock')
+      SELECT_CLAUSE_METHODS_84 = Dataset.clause_methods(:select, %w'with distinct columns from join where group having window compounds order limit lock')
       SHARE = 'SHARE'.freeze
       SHARE_ROW_EXCLUSIVE = 'SHARE ROW EXCLUSIVE'.freeze
       SHARE_UPDATE_EXCLUSIVE = 'SHARE UPDATE EXCLUSIVE'.freeze
+      SQL_WITH_RECURSIVE = "WITH RECURSIVE ".freeze
       
       # Shared methods for prepared statements when used with PostgreSQL databases.
       module PreparedStatementMethods
@@ -593,7 +603,7 @@ module Sequel
           return @prepared_sql if @prepared_sql
           super
           if @prepared_type == :insert and !@opts[:disable_insert_returning] and server_version >= 80200
-            @prepared_sql = insert_returning_pk_sql(@prepared_modify_values)
+            @prepared_sql = insert_returning_pk_sql(*@prepared_modify_values)
             meta_def(:insert_returning_pk_sql){|*args| prepared_sql}
           end
           @prepared_sql
@@ -611,12 +621,8 @@ module Sequel
       end
 
       # Return the results of an ANALYZE query as a string
-      def analyze(opts = nil)
-        analysis = []
-        fetch_rows(EXPLAIN_ANALYZE + select_sql(opts)) do |r|
-          analysis << r[QUERY_PLAN]
-        end
-        analysis.join("\r\n")
+      def analyze
+        explain(:analyze=>true)
       end
       
       # Disable the use of INSERT RETURNING, even if the server supports it
@@ -625,12 +631,8 @@ module Sequel
       end
 
       # Return the results of an EXPLAIN query as a string
-      def explain(opts = nil)
-        analysis = []
-        fetch_rows(EXPLAIN + select_sql(opts)) do |r|
-          analysis << r[QUERY_PLAN]
-        end
-        analysis.join("\r\n")
+      def explain(opts={})
+        with_sql((opts[:analyze] ? EXPLAIN_ANALYZE : EXPLAIN) + select_sql).map(QUERY_PLAN).join("\r\n")
       end
       
       # Return a cloned dataset with a :share lock type.
@@ -668,20 +670,22 @@ module Sequel
 
       # Insert a record returning the record inserted
       def insert_select(*values)
-        naked.clone(default_server_opts(:sql=>insert_returning_sql(nil, *values))).single_record if server_version >= 80200
+        return if opts[:disable_insert_returning] || server_version < 80200
+        naked.clone(default_server_opts(:sql=>insert_returning_sql(nil, *values))).single_record
       end
 
-      # Locks the table with the specified mode.
-      def lock(mode, server=nil)
-        sql = LOCK % [source_list(@opts[:from]), mode]
-        @db.synchronize(server) do
-          if block_given? # perform locking inside a transaction and yield to block
-            @db.transaction(server){@db.execute(sql, :server=>server); yield}
-          else
-            @db.execute(sql, :server=>server) # lock without a transaction
-            self
-          end
+      # Locks all tables in the dataset's FROM clause (but not in JOINs) with
+      # the specified mode (e.g. 'EXCLUSIVE').  If a block is given, starts
+      # a new transaction, locks the table, and yields.  If a block is not given
+      # just locks the tables.  Note that PostgreSQL will probably raise an error
+      # if you lock the table outside of an existing transaction.  Returns nil.
+      def lock(mode, opts={})
+        if block_given? # perform locking inside a transaction and yield to block
+          @db.transaction(opts){lock(mode, opts); yield}
+        else
+          @db.execute(LOCK % [source_list(@opts[:from]), mode], opts) # lock without a transaction
         end
+        nil
       end
       
       # For PostgreSQL version > 8.2, allow inserting multiple rows at once.
@@ -689,8 +693,22 @@ module Sequel
         return super if server_version < 80200
         
         # postgresql 8.2 introduces support for multi-row insert
-        values = values.map {|r| literal(Array(r))}.join(COMMA_SEPARATOR)
-        ["#{insert_sql_base}#{source_list(@opts[:from])} (#{identifier_list(columns)}) VALUES #{values}"]
+        [insert_sql(columns, LiteralString.new('VALUES ' + values.map {|r| literal(Array(r))}.join(COMMA_SEPARATOR)))]
+      end
+      
+      # PostgreSQL supports timezones in literal timestamps
+      def supports_timestamp_timezones?
+        true
+      end
+      
+      # PostgreSQL 8.4+ supports window functions
+      def supports_window_functions?
+        server_version >= 80400
+      end
+
+      # Return a clone of the dataset with an addition named window that can be referenced in window functions.
+      def window(name, opts)
+        clone(:window=>(@opts[:window]||[]) + [[name, SQL::Window.new(opts)]])
       end
       
       private
@@ -704,11 +722,6 @@ module Sequel
       # Use a generic blob quoting method, hopefully overridden in one of the subadapter methods
       def literal_blob(v)
         "'#{v.gsub(/[\000-\037\047\134\177-\377]/){|b| "\\#{("%o" % b[0..1].unpack("C")[0]).rjust(3, '0')}"}}'"
-      end
-
-      # PostgreSQL supports fractional timestamps
-      def literal_datetime(v)
-        "#{v.strftime(PG_TIMESTAMP_FORMAT)}.#{sprintf("%06d", (v.sec_fraction * 86400000000).to_i)}'"
       end
 
       # PostgreSQL uses FALSE for false values
@@ -726,14 +739,14 @@ module Sequel
         BOOL_TRUE
       end
 
-      # PostgreSQL supports fractional times
-      def literal_time(v)
-        "#{v.strftime(PG_TIMESTAMP_FORMAT)}.#{sprintf("%06d",v.usec)}'"
+      # The order of clauses in the SELECT SQL statement
+      def select_clause_methods
+        server_version >= 80400 ? SELECT_CLAUSE_METHODS_84 : SELECT_CLAUSE_METHODS
       end
 
-      # The order of clauses in the SELECT SQL statement
-      def select_clause_order
-        SELECT_CLAUSE_ORDER
+      # SQL fragment for named window specifications
+      def select_window_sql(sql)
+        sql << " WINDOW #{@opts[:window].map{|name, window| "#{literal(name)} AS #{literal(window)}"}.join(', ')}" if @opts[:window]
       end
 
       # Support lock mode, allowing FOR SHARE and FOR UPDATE queries.
@@ -744,6 +757,11 @@ module Sequel
         when :share
           sql << FOR_SHARE
         end
+      end
+      
+      # Use WITH RECURSIVE instead of WITH if any of the CTEs is recursive
+      def select_with_sql_base
+        opts[:with].any?{|w| w[:recursive]} ? SQL_WITH_RECURSIVE : super
       end
       
       # The version of the database server

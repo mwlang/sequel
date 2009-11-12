@@ -68,7 +68,7 @@ context "An SQLite database" do
     proc {@db.temp_store = :invalid}.should raise_error(Sequel::Error)
   end
   
-  specify "should support timestamps and datetimes and respect datetime_class" do
+  cspecify "should support timestamps and datetimes and respect datetime_class", :do, :jdbc, :amalgalite do
     @db.create_table!(:time){timestamp :t; datetime :d}
     t1 = Time.at(1)
     @db[:time] << {:t => t1, :d => t1.to_i}
@@ -95,7 +95,7 @@ context "An SQLite database" do
   
   specify "should correctly parse the schema" do
     @db.create_table!(:time2) {timestamp :t}
-    @db.schema(:time2, :reload=>true).should == [[:t, {:type=>:datetime, :allow_null=>true, :default=>nil, :db_type=>"timestamp", :primary_key=>false}]]
+    @db.schema(:time2, :reload=>true).should == [[:t, {:type=>:datetime, :allow_null=>true, :default=>nil, :ruby_default=>nil, :db_type=>"timestamp", :primary_key=>false}]]
   end
 end
 
@@ -241,6 +241,16 @@ context "SQLite dataset" do
     SQLITE_DB[:test].select(:name, :value).order(:value).to_a.should == \
       @d.select(:name, :value).order(:value).to_a
   end
+    
+  specify "should support #explain" do
+    SQLITE_DB[:test].explain.should be_a_kind_of(Array)
+  end
+  
+  specify "should have #explain work when identifier_output_method is modified" do
+    ds = SQLITE_DB[:test]
+    ds.identifier_output_method = :upcase
+    ds.explain.should be_a_kind_of(Array)
+  end
 end
 
 context "A SQLite database" do
@@ -343,6 +353,8 @@ context "A SQLite database" do
   end
   
   specify "should choose a temporary table name that isn't already used when dropping or renaming columns" do
+    sqls = []
+    @db.loggers << (l=Class.new{define_method(:info){|sql| sqls << sql}}.new)
     @db.create_table! :test3 do
       Integer :h
       Integer :i
@@ -357,9 +369,10 @@ context "A SQLite database" do
     @db[:test3].columns.should == [:h, :i]
     @db[:test3_backup0].columns.should == [:j]
     @db[:test3_backup1].columns.should == [:k]
-    sqls = @db.drop_column(:test3, :i)
-    sqls.any?{|x| x =~ /test3_backup2/}.should == true
-    sqls.any?{|x| x =~ /test3_backup[01]/}.should == false
+    sqls.clear
+    @db.drop_column(:test3, :i)
+    sqls.any?{|x| x =~ /\ACREATE TABLE.*test3_backup2/}.should == true
+    sqls.any?{|x| x =~ /\ACREATE TABLE.*test3_backup[01]/}.should == false
     @db[:test3].columns.should == [:h]
     @db[:test3_backup0].columns.should == [:j]
     @db[:test3_backup1].columns.should == [:k]
@@ -368,17 +381,15 @@ context "A SQLite database" do
       Integer :l
     end
 
-    sqls = @db.rename_column(:test3, :h, :i)
-    sqls.any?{|x| x =~ /test3_backup3/}.should == true
-    sqls.any?{|x| x =~ /test3_backup[012]/}.should == false
+    sqls.clear
+    @db.rename_column(:test3, :h, :i)
+    sqls.any?{|x| x =~ /\ACREATE TABLE.*test3_backup3/}.should == true
+    sqls.any?{|x| x =~ /\ACREATE TABLE.*test3_backup[012]/}.should == false
     @db[:test3].columns.should == [:i]
     @db[:test3_backup0].columns.should == [:j]
     @db[:test3_backup1].columns.should == [:k]
     @db[:test3_backup2].columns.should == [:l]
-  end
-  
-  specify "should not support set_column_type operations" do
-    proc {@db.set_column_type :test2, :value, :integer}.should raise_error(Sequel::Error)
+    @db.loggers.delete(l)
   end
   
   specify "should support add_index" do

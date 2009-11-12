@@ -51,6 +51,14 @@ context "Blockless Ruby Filters" do
     @d.l(:x => nil).should == '(x IS NULL)'
     @d.l(:x => [1,2,3]).should == '(x IN (1, 2, 3))'
   end
+
+  it "should use = 't' and != 't' OR IS NULL if IS TRUE is not supported" do
+    @d.meta_def(:supports_is_true?){false}
+    @d.l(:x => true).should == "(x = 't')"
+    @d.l(~{:x => true}).should == "((x != 't') OR (x IS NULL))"
+    @d.l(:x => false).should == "(x = 'f')"
+    @d.l(~{:x => false}).should == "((x != 'f') OR (x IS NULL))"
+  end
   
   it "should support != via Hash#~" do
     @d.l(~{:x => 100}).should == '(x != 100)'
@@ -319,6 +327,17 @@ context "Blockless Ruby Filters" do
     @d.l([[:x, nil], [:y, [1,2,3]]].sql_or).should == '((x IS NULL) OR (y IN (1, 2, 3)))'
   end
   
+  it "should emulate columns for array values" do
+    @d.l([:x, :y]=>[[1,2], [3,4]].sql_array).should == '((x, y) IN ((1, 2), (3, 4)))'
+    @d.l([:x, :y, :z]=>[[1,2,5], [3,4,6]]).should == '((x, y, z) IN ((1, 2, 5), (3, 4, 6)))'
+  end
+  
+  it "should emulate multiple column in if not supported" do
+    @d.meta_def(:supports_multiple_column_in?){false}
+    @d.l([:x, :y]=>[[1,2], [3,4]].sql_array).should == '(((x = 1) AND (y = 2)) OR ((x = 3) AND (y = 4)))'
+    @d.l([:x, :y, :z]=>[[1,2,5], [3,4,6]]).should == '(((x = 1) AND (y = 2) AND (z = 5)) OR ((x = 3) AND (y = 4) AND (z = 6)))'
+  end
+  
   it "should support Array#sql_string_join for concatenation of SQL strings" do
     @d.lit([:x].sql_string_join).should == '(x)'
     @d.lit([:x].sql_string_join(', ')).should == '(x)'
@@ -434,5 +453,101 @@ context "Blockless Ruby Filters" do
     it "should support double negation via ~" do
       @d.l(~~(:x > 100)).should == '(x > 100)'
     end
+  end
+end
+
+context Sequel::SQL::VirtualRow do
+  before do
+    db = Sequel::Database.new
+    db.quote_identifiers = true
+    @d = db[:items]
+    @d.meta_def(:supports_window_functions?){true}
+    def @d.l(*args, &block)
+      literal(filter_expr(*args, &block))
+    end
+  end
+
+  it "should treat methods without arguments as identifiers" do
+    @d.l{column}.should == '"column"'
+  end
+
+  it "should treat methods without arguments that have embedded double underscores as qualified identifiers" do
+    @d.l{table__column}.should == '"table"."column"'
+  end
+
+  it "should treat methods with arguments as functions with the arguments" do
+    @d.l{function(arg1, 10, 'arg3')}.should == 'function("arg1", 10, \'arg3\')'
+  end
+
+  it "should treat methods with a block and no arguments as a function call with no arguments" do
+    @d.l{version{}}.should == 'version()'
+  end
+
+  it "should treat methods with a block and a leading argument :* as a function call with the SQL wildcard" do
+    @d.l{count(:*){}}.should == 'count(*)'
+  end
+
+  it "should treat methods with a block and a leading argument :distinct as a function call with DISTINCT and the additional method arguments" do
+    @d.l{count(:distinct, column1){}}.should == 'count(DISTINCT "column1")'
+    @d.l{count(:distinct, column1, column2){}}.should == 'count(DISTINCT "column1", "column2")'
+  end
+
+  it "should raise an error if an unsupported argument is used with a block" do
+    proc{@d.l{count(:blah){}}}.should raise_error(Sequel::Error)
+  end
+
+  it "should treat methods with a block and a leading argument :over as a window function call" do
+    @d.l{rank(:over){}}.should == 'rank() OVER ()'
+  end
+
+  it "should support :partition options for window function calls" do
+    @d.l{rank(:over, :partition=>column1){}}.should == 'rank() OVER (PARTITION BY "column1")'
+    @d.l{rank(:over, :partition=>[column1, column2]){}}.should == 'rank() OVER (PARTITION BY "column1", "column2")'
+  end
+
+  it "should support :args options for window function calls" do
+    @d.l{avg(:over, :args=>column1){}}.should == 'avg("column1") OVER ()'
+    @d.l{avg(:over, :args=>[column1, column2]){}}.should == 'avg("column1", "column2") OVER ()'
+  end
+
+  it "should support :order option for window function calls" do
+    @d.l{rank(:over, :order=>column1){}}.should == 'rank() OVER (ORDER BY "column1")'
+    @d.l{rank(:over, :order=>[column1, column2]){}}.should == 'rank() OVER (ORDER BY "column1", "column2")'
+  end
+
+  it "should support :window option for window function calls" do
+    @d.l{rank(:over, :window=>:win){}}.should == 'rank() OVER ("win")'
+  end
+
+  it "should support :*=>true option for window function calls" do
+    @d.l{count(:over, :* =>true){}}.should == 'count(*) OVER ()'
+  end
+
+  it "should support :frame=>:all option for window function calls" do
+    @d.l{rank(:over, :frame=>:all){}}.should == 'rank() OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)'
+  end
+
+  it "should support :frame=>:rows option for window function calls" do
+    @d.l{rank(:over, :frame=>:rows){}}.should == 'rank() OVER (ROWS UNBOUNDED PRECEDING)'
+  end
+
+  it "should raise an error if an invalid :frame option is used" do
+    proc{@d.l{rank(:over, :frame=>:blah){}}}.should raise_error(Sequel::Error)
+  end
+
+  it "should support all these options together" do
+    @d.l{count(:over, :* =>true, :partition=>a, :order=>b, :window=>:win, :frame=>:rows){}}.should == 'count(*) OVER ("win" PARTITION BY "a" ORDER BY "b" ROWS UNBOUNDED PRECEDING)'
+  end
+
+  it "should raise an error if window functions are not supported" do
+    @d.meta_def(:supports_window_functions?){false}
+    proc{@d.l{count(:over, :* =>true, :partition=>a, :order=>b, :window=>:win, :frame=>:rows){}}}.should raise_error(Sequel::Error)
+    proc{Sequel::Dataset.new(nil).filter{count(:over, :* =>true, :partition=>a, :order=>b, :window=>:win, :frame=>:rows){}}.sql}.should raise_error(Sequel::Error)
+  end
+  
+  it "should deal with classes without requiring :: prefix" do
+    @d.l{date < Date.today}.should == "(\"date\" < '#{Date.today}')"
+    @d.l{date < Sequel::CURRENT_DATE}.should == "(\"date\" < CURRENT_DATE)"
+    @d.l{num < Math::PI.to_i}.should == "(\"num\" < 3)"
   end
 end

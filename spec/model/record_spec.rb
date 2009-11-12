@@ -35,19 +35,19 @@ describe "Model#save server use" do
 end
 
 describe "Model#save" do
-  
-  before(:each) do
+  before do
     @c = Class.new(Sequel::Model(:items)) do
       columns :id, :x, :y
     end
+    @c.dataset.meta_def(:insert){|h| super(h); 1}
     MODEL_DB.reset
   end
   
   it "should insert a record for a new model instance" do
     o = @c.new(:x => 1)
     o.save
-    
-    MODEL_DB.sqls.first.should == "INSERT INTO items (x) VALUES (1)"
+    MODEL_DB.sqls.should == ["INSERT INTO items (x) VALUES (1)",
+      "SELECT * FROM items WHERE (id = 1) LIMIT 1"]
   end
 
   it "should use dataset's insert_select method if present" do
@@ -60,15 +60,41 @@ describe "Model#save" do
     o.save
     
     o.values.should == {:y=>2}
-    MODEL_DB.sqls.first.should == "INSERT INTO items (y) VALUES (2)"
+    MODEL_DB.sqls.should == ["INSERT INTO items (y) VALUES (2)"]
+  end
+
+  it "should use value returned by insert as the primary key" do
+    @c.dataset.meta_def(:insert){|h| super(h); 13}
+    o = @c.new(:x => 11)
+    o.save
+    MODEL_DB.sqls.should == ["INSERT INTO items (x) VALUES (11)",
+      "SELECT * FROM items WHERE (id = 13) LIMIT 1"]
+  end
+
+  it "should work correctly for inserting a record without a primary key" do
+    @c.dataset.meta_def(:insert){|h| super(h); 13}
+    @c.no_primary_key
+    o = @c.new(:x => 11)
+    o.save
+    MODEL_DB.sqls.should == ["INSERT INTO items (x) VALUES (11)"]
+  end
+
+  it "should set the autoincrementing_primary_key value to the value returned by insert" do
+    @c.dataset.meta_def(:insert){|h| super(h); 13}
+    @c.unrestrict_primary_key
+    @c.set_primary_key [:x, :y]
+    o = @c.new(:x => 11)
+    o.meta_def(:autoincrementing_primary_key){:y}
+    o.save
+    MODEL_DB.sqls.length.should == 2
+    MODEL_DB.sqls.first.should == "INSERT INTO items (x) VALUES (11)"
+    MODEL_DB.sqls.last.should =~ %r{SELECT \* FROM items WHERE \(\([xy] = 1[13]\) AND \([xy] = 1[13]\)\) LIMIT 1}
   end
 
   it "should update a record for an existing model instance" do
     o = @c.load(:id => 3, :x => 1)
     o.save
-    
-    MODEL_DB.sqls.first.should =~ 
-      /UPDATE items SET (id = 3, x = 1|x = 1, id = 3) WHERE \(id = 3\)/
+    MODEL_DB.sqls.should == ["UPDATE items SET x = 1 WHERE (id = 3)"]
   end
   
   it "should update only the given columns if given" do
@@ -86,6 +112,23 @@ describe "Model#save" do
     o.save(:y)
     o.changed_columns.should == []
   end
+  
+  it "should mark all columns as not changed if this is a new record" do
+    o = @c.new(:x => 1, :y => nil)
+    o.x = 4
+    o.changed_columns.should == [:x]
+    o.save
+    o.changed_columns.should == []
+  end
+  
+  it "should mark all columns as not changed if this is a new record and insert_select was used" do
+    @c.dataset.meta_def(:insert_select){|h| h.merge(:id=>1)}
+    o = @c.new(:x => 1, :y => nil)
+    o.x = 4
+    o.changed_columns.should == [:x]
+    o.save
+    o.changed_columns.should == []
+  end
 
   it "should store previous value of @new in @was_new and as well as the hash used for updating in @columns_updated until after hooks finish running" do
     res = nil
@@ -101,7 +144,7 @@ describe "Model#save" do
     o = @c.load(:id => 23,:x => 1, :y => nil)
     o[:x] = 2
     o.save
-    res.should == [{:id => 23,:x => 2, :y => nil}, nil]
+    res.should == [{:x => 2, :y => nil}, nil]
     o.after_save
     res.should == [nil, nil]
 
@@ -166,27 +209,128 @@ describe "Model#save" do
   end
 end
 
+describe "Model#marshallable" do
+  before do
+    class ::Album < Sequel::Model
+      columns :id, :x
+    end
+    Album.dataset.meta_def(:insert){|h| super(h); 1}
+  end
+  after do
+    Object.send(:remove_const, :Album)
+  end
+
+  it "should make an object marshallable" do
+    i = Album.new(:x=>2)
+    s = nil
+    i2 = nil
+    i.marshallable!
+    proc{s = Marshal.dump(i)}.should_not raise_error
+    proc{i2 = Marshal.load(s)}.should_not raise_error
+    i2.should == i
+
+    i.save
+    i.marshallable!
+    proc{s = Marshal.dump(i)}.should_not raise_error
+    proc{i2 = Marshal.load(s)}.should_not raise_error
+    i2.should == i
+
+    i.save
+    i.marshallable!
+    proc{s = Marshal.dump(i)}.should_not raise_error
+    proc{i2 = Marshal.load(s)}.should_not raise_error
+    i2.should == i
+  end
+end
+
+describe "Model#modified[!?]" do
+  before do
+    @c = Class.new(Sequel::Model(:items))
+    @c.class_eval do
+      columns :id, :x
+      @db_schema = {:x => {:type => :integer}}
+    end
+    MODEL_DB.reset
+  end
+  
+  it "should be true if the object is new" do
+    @c.new.modified?.should == true
+  end
+  
+  it "should be false if the object has not been modified" do
+    @c.load(:id=>1).modified?.should == false
+  end
+  
+  it "should be true if the object has been modified" do
+    o = @c.load(:id=>1, :x=>2)
+    o.x = 3
+    o.modified?.should == true
+  end
+  
+  it "should be true if the object is marked modified!" do
+    o = @c.load(:id=>1, :x=>2)
+    o.modified!
+    o.modified?.should == true
+  end
+  
+  it "should be false if the object is marked modified! after saving until modified! again" do
+    o = @c.load(:id=>1, :x=>2)
+    o.modified!
+    o.save
+    o.modified?.should == false
+    o.modified!
+    o.modified?.should == true
+  end
+  
+  it "should be false if a column value is set that is the same as the current value after typecasting" do
+    o = @c.load(:id=>1, :x=>2)
+    o.x = '2'
+    o.modified?.should == false
+  end
+  
+  it "should be true if a column value is set that is the different as the current value after typecasting" do
+    o = @c.load(:id=>1, :x=>'2')
+    o.x = '2'
+    o.modified?.should == true
+  end
+end
+
 describe "Model#save_changes" do
   
-  before(:each) do
-    MODEL_DB.reset
-
+  before do
     @c = Class.new(Sequel::Model(:items)) do
       unrestrict_primary_key
       columns :id, :x, :y
     end
+    MODEL_DB.reset
   end
   
-  it "should do nothing if no changed columns" do
-    o = @c.new(:id => 3, :x => 1, :y => nil)
+  it "should always save if the object is new" do
+    o = @c.new(:x => 1)
     o.save_changes
-    
-    MODEL_DB.sqls.should be_empty
+    MODEL_DB.sqls.first.should == "INSERT INTO items (x) VALUES (1)"
+  end
 
+  it "should take options passed to save" do
+    o = @c.new(:x => 1)
+    def o.valid?; false; end
+    proc{o.save_changes}.should raise_error(Sequel::Error)
+    MODEL_DB.sqls.should == []
+    o.save_changes(:validate=>false)
+    MODEL_DB.sqls.first.should == "INSERT INTO items (x) VALUES (1)"
+  end
+
+  it "should do nothing if no changed columns" do
     o = @c.load(:id => 3, :x => 1, :y => nil)
     o.save_changes
-    
-    MODEL_DB.sqls.should be_empty
+    MODEL_DB.sqls.should == []
+  end
+  
+  it "should do nothing if modified? is false" do
+    o = @c.load(:id => 3, :x => 1, :y => nil)
+    def o.modified?; false; end
+    o.save_changes
+    MODEL_DB.sqls.should == []
   end
   
   it "should update only changed columns" do
@@ -225,6 +369,14 @@ describe "Model#save_changes" do
     o[:y] = 4
     o.save_changes
     MODEL_DB.sqls.should == ["UPDATE items SET y = 4 WHERE (id = 3)"]
+  end
+  
+  it "should clear changed_columns" do
+    o = @c.load(:id => 3, :x => 1, :y => nil)
+    o.x = 4
+    o.changed_columns.should == [:x]
+    o.save_changes
+    o.changed_columns.should == []
   end
 
   it "should update columns changed in a before_update hook" do
@@ -1094,6 +1246,16 @@ describe Sequel::Model, "typecasting" do
     m.x.should == y
   end
 
+  specify "should accept a hash with symbol or string keys for a date field" do
+    @c.instance_variable_set(:@db_schema, {:x=>{:type=>:date}})
+    m = @c.new
+    y = Date.new(2007,10,21)
+    m.x = {:year=>2007, :month=>10, :day=>21}
+    m.x.should == y
+    m.x = {'year'=>'2007', 'month'=>'10', 'day'=>'21'}
+    m.x.should == y
+  end
+
   specify "should raise an error if invalid data is used in a date field" do
     @c.instance_variable_set(:@db_schema, {:x=>{:type=>:date}})
     proc{@c.new.x = 'a'}.should raise_error(Sequel::InvalidValue)
@@ -1116,6 +1278,16 @@ describe Sequel::Model, "typecasting" do
     m.x = x
     m.x.should == y
     m.x = y
+    m.x.should == y
+  end
+
+  specify "should accept a hash with symbol or string keys for a time field" do
+    @c.instance_variable_set(:@db_schema, {:x=>{:type=>:time}})
+    m = @c.new
+    y = Time.parse('10:20:30')
+    m.x = {:hour=>10, :minute=>20, :second=>30}
+    m.x.should == y
+    m.x = {'hour'=>'10', 'minute'=>'20', 'second'=>'30'}
     m.x.should == y
   end
 
@@ -1158,6 +1330,22 @@ describe Sequel::Model, "typecasting" do
     m.x.should == y
     m.x = Date.parse('2007-10-21')
     m.x.should == DateTime.parse('2007-10-21')
+  end
+
+  specify "should accept a hash with symbol or string keys for a datetime field" do
+    @c.instance_variable_set(:@db_schema, {:x=>{:type=>:datetime}})
+    m = @c.new
+    y = Time.parse('2007-10-21 10:20:30')
+    m.x = {:year=>2007, :month=>10, :day=>21, :hour=>10, :minute=>20, :second=>30}
+    m.x.should == y
+    m.x = {'year'=>'2007', 'month'=>'10', 'day'=>'21', 'hour'=>'10', 'minute'=>'20', 'second'=>'30'}
+    m.x.should == y
+    Sequel.datetime_class = DateTime
+    y = DateTime.parse('2007-10-21 10:20:30')
+    m.x = {:year=>2007, :month=>10, :day=>21, :hour=>10, :minute=>20, :second=>30}
+    m.x.should == y
+    m.x = {'year'=>'2007', 'month'=>'10', 'day'=>'21', 'hour'=>'10', 'minute'=>'20', 'second'=>'30'}
+    m.x.should == y
   end
 
   specify "should raise an error if invalid data is used in a datetime field" do

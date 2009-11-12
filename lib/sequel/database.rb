@@ -21,11 +21,19 @@ module Sequel
 
     SQL_BEGIN = 'BEGIN'.freeze
     SQL_COMMIT = 'COMMIT'.freeze
+    SQL_RELEASE_SAVEPOINT = 'RELEASE SAVEPOINT autopoint_%d'.freeze
     SQL_ROLLBACK = 'ROLLBACK'.freeze
+    SQL_ROLLBACK_TO_SAVEPOINT = 'ROLLBACK TO SAVEPOINT autopoint_%d'.freeze
+    SQL_SAVEPOINT = 'SAVEPOINT autopoint_%d'.freeze
     
     TRANSACTION_BEGIN = 'Transaction.begin'.freeze
     TRANSACTION_COMMIT = 'Transaction.commit'.freeze
     TRANSACTION_ROLLBACK = 'Transaction.rollback'.freeze
+    
+    POSTGRES_DEFAULT_RE = /\A(?:B?('.*')::[^']+|\((-?\d+(?:\.\d+)?)\))\z/
+    MSSQL_DEFAULT_RE = /\A(?:\(N?('.*')\)|\(\((-?\d+(?:\.\d+)?)\)\))\z/
+    MYSQL_TIMESTAMP_RE = /\ACURRENT_(?:DATE|TIMESTAMP)?\z/
+    STRING_DEFAULT_RE = /\A'(.*)'\z/
 
     # The identifier input method to use by default
     @@identifier_input_method = nil
@@ -73,7 +81,7 @@ module Sequel
     def initialize(opts = {}, &block)
       @opts ||= opts
       
-      @single_threaded = opts.include?(:single_threaded) ? opts[:single_threaded] : @@single_threaded
+      @single_threaded = opts.include?(:single_threaded) ? typecast_value_boolean(opts[:single_threaded]) : @@single_threaded
       @schemas = {}
       @default_schema = opts.include?(:default_schema) ? opts[:default_schema] : default_schema_default
       @prepared_statements = {}
@@ -102,7 +110,7 @@ module Sequel
         begin
           Sequel.require "adapters/#{scheme}"
         rescue LoadError => e
-          raise AdapterNotFound, "Could not load #{scheme} adapter:\n  #{e.message}"
+          raise Sequel.convert_exception_class(e, AdapterNotFound)
         end
         
         # make sure we actually loaded the adapter
@@ -130,9 +138,10 @@ module Sequel
           scheme = uri.scheme
           scheme = :dbi if scheme =~ /\Adbi-/
           c = adapter_class(scheme)
-          uri_options = {}
+          uri_options = c.send(:uri_to_options, uri)
           uri.query.split('&').collect{|s| s.split('=')}.each{|k,v| uri_options[k.to_sym] = v} unless uri.query.to_s.strip.empty?
-          opts = c.send(:uri_to_options, uri).merge(uri_options).merge(opts)
+          uri_options.entries.each{|k,v| uri_options[k] = URI.unescape(v) if v.is_a?(String)}
+          opts = uri_options.merge(opts)
         end
       when Hash
         opts = conn_string.merge(opts)
@@ -226,9 +235,10 @@ module Sequel
     
     ### Instance Methods ###
 
-    # Executes the supplied SQL statement string.
+    # Runs the supplied SQL statement string on the database server.
+    # Alias for run.
     def <<(sql)
-      execute_ddl(sql)
+      run(sql)
     end
     
     # Returns a dataset from the database. If the first argument is a string,
@@ -421,6 +431,14 @@ module Sequel
       @quote_identifiers = @opts.include?(:quote_identifiers) ? @opts[:quote_identifiers] : (@@quote_identifiers.nil? ? quote_identifiers_default : @@quote_identifiers)
     end
     
+    # Runs the supplied SQL statement string on the database server. Returns nil.
+    # Options:
+    # * :server - The server to run the SQL on.
+    def run(sql, opts={})
+      execute_ddl(sql, opts)
+      nil
+    end
+    
     # Returns a new dataset with the select method invoked.
     def select(*args, &block)
       dataset.select(*args, &block)
@@ -450,6 +468,7 @@ module Sequel
 
       cols = schema_parse_table(table_name, opts)
       raise(Error, 'schema parsing returned no columns, table probably doesn\'t exist') if cols.nil? || cols.empty?
+      cols.each{|_,c| c[:ruby_default] = column_schema_to_ruby_default(c[:default], c[:type])}
       @schemas[quoted_name] = cols
     end
 
@@ -463,7 +482,7 @@ module Sequel
       @pool.hold(server || :default, &block)
     end
     
-    # Whether the database and adapter support savepoints
+    # Whether the database and adapter support savepoints, false by default
     def supports_savepoints?
       false
     end
@@ -515,10 +534,8 @@ module Sequel
       meth = "typecast_value_#{column_type}"
       begin
         respond_to?(meth, true) ? send(meth, value) : value
-      rescue ArgumentError, TypeError => exp
-        e = Sequel::InvalidValue.new("#{exp.class} #{exp.message}")
-        e.set_backtrace(exp.backtrace)
-        raise e
+      rescue ArgumentError, TypeError => e
+        raise Sequel.convert_exception_class(e, InvalidValue)
       end
     end
     
@@ -559,7 +576,7 @@ module Sequel
         t = begin_transaction(conn)
         yield(conn)
       rescue Exception => e
-        rollback_transaction(t)
+        rollback_transaction(t) if t
         transaction_error(e)
       ensure
         begin
@@ -574,17 +591,38 @@ module Sequel
     
     # Add the current thread to the list of active transactions
     def add_transaction
-      @transactions << Thread.current
+      th = Thread.current
+      if supports_savepoints?
+        unless @transactions.include?(th)
+          th[:sequel_transaction_depth] = 0
+          @transactions << th
+        end
+      else
+        @transactions << th
+      end
     end    
 
     # Whether the current thread/connection is already inside a transaction
     def already_in_transaction?(conn, opts)
-      @transactions.include?(Thread.current)
+      @transactions.include?(Thread.current) && (!supports_savepoints? || !opts[:savepoint])
     end
     
+    # SQL to start a new savepoint
+    def begin_savepoint_sql(depth)
+      SQL_SAVEPOINT % depth
+    end
+
     # Start a new database transaction on the given connection.
     def begin_transaction(conn)
-      log_connection_execute(conn, begin_transaction_sql)
+      if supports_savepoints?
+        th = Thread.current
+        depth = th[:sequel_transaction_depth]
+        conn = transaction_statement_object(conn) if respond_to?(:transaction_statement_object, true)
+        log_connection_execute(conn, depth > 0 ? begin_savepoint_sql(depth) : begin_transaction_sql)
+        th[:sequel_transaction_depth] += 1
+      else
+        log_connection_execute(conn, begin_transaction_sql)
+      end
       conn
     end
     
@@ -611,9 +649,69 @@ module Sequel
       end
     end
     
+    # Convert the given default, which should be a database specific string, into
+    # a ruby object.
+    def column_schema_to_ruby_default(default, type)
+      return if default.nil?
+      orig_default = default
+      if database_type == :postgres and m = POSTGRES_DEFAULT_RE.match(default)
+        default = m[1] || m[2]
+      end
+      if database_type == :mssql and m = MSSQL_DEFAULT_RE.match(default)
+        default = m[1] || m[2]
+      end
+      if [:string, :blob, :date, :datetime, :time, :enum].include?(type)
+        if database_type == :mysql
+          return if [:date, :datetime, :time].include?(type) && MYSQL_TIMESTAMP_RE.match(default)
+          orig_default = default = "'#{default.gsub("'", "''").gsub('\\', '\\\\')}'"
+        end
+        return unless m = STRING_DEFAULT_RE.match(default)
+        default = m[1].gsub("''", "'")
+      end
+      res = begin
+        case type
+        when :boolean
+          case default 
+          when /[f0]/i
+            false
+          when /[t1]/i
+            true
+          end
+        when :string, :enum
+          default
+        when :blob
+          Sequel::SQL::Blob.new(default)
+        when :integer
+          Integer(default)
+        when :float
+          Float(default)
+        when :date
+          Sequel.string_to_date(default)
+        when :datetime
+          DateTime.parse(default)
+        when :time
+          Sequel.string_to_time(default)
+        when :decimal
+          BigDecimal.new(default)
+        end
+      rescue
+        nil
+      end
+    end
+   
+    # SQL to commit a savepoint
+    def commit_savepoint_sql(depth)
+      SQL_RELEASE_SAVEPOINT % depth
+    end
+
     # Commit the active transaction on the connection
     def commit_transaction(conn)
-      log_connection_execute(conn, commit_transaction_sql)
+      if supports_savepoints?
+        depth = Thread.current[:sequel_transaction_depth]
+        log_connection_execute(conn, depth > 1 ? commit_savepoint_sql(depth-1) : commit_transaction_sql)
+      else
+        log_connection_execute(conn, commit_transaction_sql)
+      end
     end
 
     # SQL to COMMIT a transaction.
@@ -705,9 +803,7 @@ module Sequel
     # and traceback.
     def raise_error(exception, opts={})
       if !opts[:classes] || Array(opts[:classes]).any?{|c| exception.is_a?(c)}
-        e = (opts[:disconnect] ? DatabaseDisconnectError : DatabaseError).new("#{exception.class}: #{exception.message}")
-        e.set_backtrace(exception.backtrace)
-        raise e
+        raise Sequel.convert_exception_class(exception, opts[:disconnect] ? DatabaseDisconnectError : DatabaseError)
       else
         raise exception
       end
@@ -720,7 +816,8 @@ module Sequel
     
     # Remove the current thread from the list of active transactions
     def remove_transaction(conn)
-      @transactions.delete(Thread.current)
+      th = Thread.current
+      @transactions.delete(th) if !supports_savepoints? || ((th[:sequel_transaction_depth] -= 1) <= 0)
     end
 
     # Remove the cached schema_utility_dataset, because the identifier
@@ -729,9 +826,19 @@ module Sequel
       @schema_utility_dataset = nil
     end
     
+    # SQL to rollback to a savepoint
+    def rollback_savepoint_sql(depth)
+      SQL_ROLLBACK_TO_SAVEPOINT % depth
+    end
+
     # Rollback the active transaction on the connection
     def rollback_transaction(conn)
-      log_connection_execute(conn, rollback_transaction_sql)
+      if supports_savepoints?
+        depth = Thread.current[:sequel_transaction_depth]
+        log_connection_execute(conn, depth > 1 ? rollback_savepoint_sql(depth-1) : rollback_transaction_sql)
+      else
+        log_connection_execute(conn, rollback_transaction_sql)
+      end
     end
 
     # Split the schema information from the table
@@ -749,28 +856,28 @@ module Sequel
     # integer, string, date, datetime, boolean, and float.
     def schema_column_type(db_type)
       case db_type
-      when /\Atinyint/io
-        Sequel.convert_tinyint_to_bool ? :boolean : :integer
       when /\Ainterval\z/io
         :interval
-      when /\A(character( varying)?|(var)?char|text)/io
+      when /\A(character( varying)?|n?(var)?char|n?text)/io
         :string
-      when /\A(int(eger)?|bigint|smallint)/io
+      when /\A(int(eger)?|(big|small|tiny)int)/io
         :integer
       when /\Adate\z/io
         :date
-      when /\A(datetime|timestamp( with(out)? time zone)?)\z/io
+      when /\A((small)?datetime|timestamp( with(out)? time zone)?)\z/io
         :datetime
       when /\Atime( with(out)? time zone)?\z/io
         :time
-      when /\Aboolean\z/io
+      when /\A(boolean|bit)\z/io
         :boolean
       when /\A(real|float|double( precision)?)\z/io
         :float
-      when /\A(((numeric|decimal)(\(\d+,\d+\))?)|money)\z/io
+      when /\A(((numeric|decimal)(\(\d+,\d+\))?)|(small)?money)\z/io
         :decimal
-      when /bytea|blob/io
+      when /bytea|blob|image|(var)?binary/io
         :blob
+      when /\Aenum/
+        :enum
       end
     end
 
@@ -801,7 +908,7 @@ module Sequel
 
     # Raise a database error unless the exception is an Rollback.
     def transaction_error(e)
-      raise_error(e, :classes=>database_error_classes) unless Rollback === e
+      raise_error(e, :classes=>database_error_classes) unless e.is_a?(Rollback)
     end
 
     # Typecast the value to an SQL::Blob
@@ -828,6 +935,8 @@ module Sequel
         Date.new(value.year, value.month, value.day)
       when String
         Sequel.string_to_date(value)
+      when Hash
+        Date.new(*[:year, :month, :day].map{|x| (value[x] || value[x.to_s]).to_i})
       else
         raise InvalidValue, "invalid value for Date: #{value.inspect}"
       end
@@ -835,14 +944,12 @@ module Sequel
 
     # Typecast the value to a DateTime or Time depending on Sequel.datetime_class
     def typecast_value_datetime(value)
-      raise(Sequel::InvalidValue, "invalid value for Datetime: #{value.inspect}") unless [DateTime, Date, Time, String].any?{|c| value.is_a?(c)}
-      if Sequel.datetime_class === value
-        # Already the correct class, no need to convert
-       value
+      raise(Sequel::InvalidValue, "invalid value for Datetime: #{value.inspect}") unless [DateTime, Date, Time, String, Hash].any?{|c| value.is_a?(c)}
+      klass = Sequel.datetime_class
+      if value.is_a?(Hash)
+        klass.send(klass == Time ? :mktime : :new, *[:year, :month, :day, :hour, :minute, :second].map{|x| (value[x] || value[x.to_s]).to_i})
       else
-        # First convert it to standard ISO 8601 time, then
-        # parse that string using the time class.
-        Sequel.string_to_datetime(Time === value ? value.iso8601 : value.to_s)
+        Sequel.typecast_to_application_timestamp(value)
       end
     end
 
@@ -880,6 +987,9 @@ module Sequel
         value
       when String
         Sequel.string_to_time(value)
+      when Hash
+        t = Time.now
+        Time.mktime(t.year, t.month, t.day, *[:hour, :minute, :second].map{|x| (value[x] || value[x.to_s]).to_i})
       else
         raise Sequel::InvalidValue, "invalid value for Time: #{value.inspect}"
       end

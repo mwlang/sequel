@@ -73,6 +73,24 @@ describe Sequel::Model::Associations::AssociationReflection, "#reciprocal" do
     ParParentTwo.association_reflection(:par_parents).reciprocal.should == :par_parent_twos
     ParParentThree.association_reflection(:par_parents).reciprocal.should == :par_parent_threes
   end
+  
+  it "should handle composite keys" do
+    ParParent.many_to_one :par_parent_two, :key=>[:a, :b], :primary_key=>[:c, :b]
+    ParParent.many_to_one :par_parent_three, :key=>[:d, :e], :primary_key=>[:c, :b]
+    ParParentTwo.one_to_many :par_parents, :primary_key=>[:c, :b], :key=>[:a, :b]
+    ParParentThree.one_to_many :par_parents, :primary_key=>[:c, :b], :key=>[:d, :e]
+
+    ParParentTwo.association_reflection(:par_parents).reciprocal.should == :par_parent_two
+    ParParentThree.association_reflection(:par_parents).reciprocal.should == :par_parent_three
+
+    ParParent.many_to_many :par_parent_twos, :left_key=>[:l1, :l2], :right_key=>[:r1, :r2], :left_primary_key=>[:pl1, :pl2], :right_primary_key=>[:pr1, :pr2], :join_table=>:jt
+    ParParent.many_to_many :par_parent_threes, :right_key=>[:l1, :l2], :left_key=>[:r1, :r2], :left_primary_key=>[:pl1, :pl2], :right_primary_key=>[:pr1, :pr2], :join_table=>:jt
+    ParParentTwo.many_to_many :par_parents, :right_key=>[:l1, :l2], :left_key=>[:r1, :r2], :right_primary_key=>[:pl1, :pl2], :left_primary_key=>[:pr1, :pr2], :join_table=>:jt
+    ParParentThree.many_to_many :par_parents, :left_key=>[:l1, :l2], :right_key=>[:r1, :r2], :right_primary_key=>[:pl1, :pl2], :left_primary_key=>[:pr1, :pr2], :join_table=>:jt
+
+    ParParentTwo.association_reflection(:par_parents).reciprocal.should == :par_parent_twos
+    ParParentThree.association_reflection(:par_parents).reciprocal.should == :par_parent_threes
+  end
 
   it "should figure out the reciprocal if the :reciprocal value is not present" do
     ParParent.many_to_one :par_parent_two
@@ -114,6 +132,44 @@ describe Sequel::Model::Associations::AssociationReflection, "#select" do
     @c.many_to_one :c, :class=>'ParParent'
     @c.association_reflection(:c).keys.should_not include(:select)
     @c.association_reflection(:c).select.should == nil
+  end
+end
+
+describe Sequel::Model::Associations::AssociationReflection, "#can_have_associated_objects?" do
+  it "should be true for any given object (for backward compatibility)" do
+    Sequel::Model::Associations::AssociationReflection.new.can_have_associated_objects?(Object.new).should == true
+  end
+end
+
+describe Sequel::Model::Associations::AssociationReflection, "#associated_object_keys" do
+  before do
+    @c = Class.new(Sequel::Model)
+    class ::ParParent < Sequel::Model; end
+  end
+
+  it "should use the primary keys for a many_to_one association" do
+    @c.many_to_one :c, :class=>ParParent
+    @c.association_reflection(:c).associated_object_keys.should == [:id]
+    @c.many_to_one :c, :class=>ParParent, :primary_key=>:d_id
+    @c.association_reflection(:c).associated_object_keys.should == [:d_id]
+    @c.many_to_one :c, :class=>ParParent, :key=>[:c_id1, :c_id2], :primary_key=>[:id1, :id2]
+    @c.association_reflection(:c).associated_object_keys.should == [:id1, :id2]
+  end
+  it "should use the keys for a one_to_many association" do
+    ParParent.one_to_many :cs, :class=>ParParent
+    ParParent.association_reflection(:cs).associated_object_keys.should == [:par_parent_id]
+    @c.one_to_many :cs, :class=>ParParent, :key=>:d_id
+    @c.association_reflection(:cs).associated_object_keys.should == [:d_id]
+    @c.one_to_many :cs, :class=>ParParent, :key=>[:c_id1, :c_id2], :primary_key=>[:id1, :id2]
+    @c.association_reflection(:cs).associated_object_keys.should == [:c_id1, :c_id2]
+  end
+  it "should use the right primary keys for a many_to_many association" do
+    @c.many_to_many :cs, :class=>ParParent
+    @c.association_reflection(:cs).associated_object_keys.should == [:id]
+    @c.many_to_many :cs, :class=>ParParent, :right_primary_key=>:d_id
+    @c.association_reflection(:cs).associated_object_keys.should == [:d_id]
+    @c.many_to_many :cs, :class=>ParParent, :right_key=>[:c_id1, :c_id2], :right_primary_key=>[:id1, :id2]
+    @c.association_reflection(:cs).associated_object_keys.should == [:id1, :id2]
   end
 end
 

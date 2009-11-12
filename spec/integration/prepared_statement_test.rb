@@ -23,9 +23,41 @@ describe "Prepared Statements and Bound Arguments" do
     @ds.filter(:number=>@ds.ba(:$n)).call(:all, :n=>10).should == [{:id=>1, :number=>10}]
     @ds.filter(:number=>@ds.ba(:$n)).call(:first, :n=>10).should == {:id=>1, :number=>10}
   end
+    
+  specify "should support blocks for select and all" do
+    @ds.filter(:number=>@ds.ba(:$n)).call(:select, :n=>10){|r| r[:number] *= 2}.should == [{:id=>1, :number=>20}]
+    @ds.filter(:number=>@ds.ba(:$n)).call(:all, :n=>10){|r| r[:number] *= 2}.should == [{:id=>1, :number=>20}]
+  end
+    
+  specify "should support binding variables before the call with #bind" do
+    @ds.filter(:number=>@ds.ba(:$n)).bind(:n=>10).call(:select).should == [{:id=>1, :number=>10}]
+    @ds.filter(:number=>@ds.ba(:$n)).bind(:n=>10).call(:all).should == [{:id=>1, :number=>10}]
+    @ds.filter(:number=>@ds.ba(:$n)).bind(:n=>10).call(:first).should == {:id=>1, :number=>10}
+    
+    @ds.bind(:n=>10).filter(:number=>@ds.ba(:$n)).call(:select).should == [{:id=>1, :number=>10}]
+    @ds.bind(:n=>10).filter(:number=>@ds.ba(:$n)).call(:all).should == [{:id=>1, :number=>10}]
+    @ds.bind(:n=>10).filter(:number=>@ds.ba(:$n)).call(:first).should == {:id=>1, :number=>10}
+  end
+  
+  specify "should allow overriding variables specified with #bind" do
+    @ds.filter(:number=>@ds.ba(:$n)).bind(:n=>1).call(:select, :n=>10).should == [{:id=>1, :number=>10}]
+    @ds.filter(:number=>@ds.ba(:$n)).bind(:n=>1).call(:all, :n=>10).should == [{:id=>1, :number=>10}]
+    @ds.filter(:number=>@ds.ba(:$n)).bind(:n=>1).call(:first, :n=>10).should == {:id=>1, :number=>10}
+    
+    @ds.filter(:number=>@ds.ba(:$n)).bind(:n=>1).bind(:n=>10).call(:select).should == [{:id=>1, :number=>10}]
+    @ds.filter(:number=>@ds.ba(:$n)).bind(:n=>1).bind(:n=>10).call(:all).should == [{:id=>1, :number=>10}]
+    @ds.filter(:number=>@ds.ba(:$n)).bind(:n=>1).bind(:n=>10).call(:first).should == {:id=>1, :number=>10}
+  end
 
   specify "should support placeholder literal strings" do
     @ds.filter("number = ?", @ds.ba(:$n)).call(:select, :n=>10).should == [{:id=>1, :number=>10}]
+  end
+
+  specify "should support named placeholder literal strings and handle multiple named placeholders correctly" do
+    @ds.filter("number = :n", :n=>@ds.ba(:$n)).call(:select, :n=>10).should == [{:id=>1, :number=>10}]
+    @ds.insert(:number=>20)
+    @ds.insert(:number=>30)
+    @ds.filter("number > :n1 AND number < :n2 AND number = :n3", :n3=>@ds.ba(:$n3), :n2=>@ds.ba(:$n2), :n1=>@ds.ba(:$n1)).call(:select, :n3=>20, :n2=>30, :n1=>10).should == [{:id=>2, :number=>20}]
   end
 
   specify "should support datasets with static sql and placeholders" do
@@ -49,9 +81,9 @@ describe "Prepared Statements and Bound Arguments" do
   end
 
   specify "should support bound variables with insert" do
-    @ds.call(:insert, {:n=>20, :i=>100}, :id=>@ds.ba(:$i), :number=>@ds.ba(:$n))
+    @ds.call(:insert, {:n=>20}, :number=>@ds.ba(:$n))
     @ds.count.should == 2
-    @ds.order(:id).all.should == [{:id=>1, :number=>10}, {:id=>100, :number=>20}]
+    @ds.order(:id).map(:number).should == [10, 20]
   end
 
   specify "should have insert return primary key value when using bound arguments" do
@@ -84,10 +116,10 @@ describe "Prepared Statements and Bound Arguments" do
   end
 
   specify "should support prepared statements with insert" do
-    @ds.prepare(:insert, :insert_n, :id=>@ds.ba(:$i), :number=>@ds.ba(:$n))
-    INTEGRATION_DB.call(:insert_n, :n=>20, :i=>100)
+    @ds.prepare(:insert, :insert_n, :number=>@ds.ba(:$n))
+    INTEGRATION_DB.call(:insert_n, :n=>20)
     @ds.count.should == 2
-    @ds.order(:id).all.should == [{:id=>1, :number=>10}, {:id=>100, :number=>20}]
+    @ds.order(:id).map(:number).should == [10, 20]
   end
 
   specify "should have insert return primary key value when using prepared statements" do

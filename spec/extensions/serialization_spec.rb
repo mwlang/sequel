@@ -1,6 +1,7 @@
 require File.join(File.dirname(__FILE__), "spec_helper")
 
 require 'yaml'
+require 'json'
 
 describe "Serialization plugin" do
   before do
@@ -10,7 +11,7 @@ describe "Serialization plugin" do
         end
       end)
       no_primary_key
-      columns :id, :abc, :def
+      columns :id, :abc, :def, :ghi
     end
     MODEL_DB.reset
   end
@@ -23,6 +24,10 @@ describe "Serialization plugin" do
     @c.plugin :serialization, :marshal, :def
     @c.create(:abc => 1, :def=> 1)
     MODEL_DB.sqls.last.should =~ /INSERT INTO items \((abc, def|def, abc)\) VALUES \(('--- 1\n', 'BAhpBg==\n'|'BAhpBg==\n', '--- 1\n')\)/
+    
+    @c.plugin :serialization, :json, :ghi
+    @c.create(:ghi => [123])
+    MODEL_DB.sqls.last.should =~ /INSERT INTO items \((ghi)\) VALUES \('\[123\]'\)/
   end
 
   it "should allow serializing attributes to yaml" do
@@ -55,6 +60,18 @@ describe "Serialization plugin" do
     MODEL_DB.sqls.should == [ \
       "INSERT INTO items (abc) VALUES ('BAhpBg==\n')", \
       "INSERT INTO items (abc) VALUES ('#{x}')", \
+    ]
+  end
+  
+  it "should allow serializing attributes to json" do
+    @c.plugin :serialization, :json, :ghi
+    @c.create(:ghi => [1])
+    @c.create(:ghi => ["hello"])
+    
+    x = JSON.generate ["hello"]
+    MODEL_DB.sqls.should == [ \
+      "INSERT INTO items (ghi) VALUES ('[1]')", \
+      "INSERT INTO items (ghi) VALUES ('#{x}')", \
     ]
   end
 
@@ -102,6 +119,29 @@ describe "Serialization plugin" do
     MODEL_DB.sqls.should == ["UPDATE items SET abc = '#{[Marshal.dump(23)].pack('m')}' WHERE (id = 1)",
       "INSERT INTO items (abc) VALUES ('#{[Marshal.dump([1, 2, 3])].pack('m')}')"]
   end
+  
+  it "should translate values to and from json serialization format using accessor methods" do
+    @c.set_primary_key :id
+    @c.plugin :serialization, :json, :abc, :def
+    
+    ds = @c.dataset
+    def ds.fetch_rows(sql, &block)
+      block.call(:id => 1, :abc => JSON.generate([1]), :def => JSON.generate(["hello"]))
+    end
+    
+    o = @c.first
+    o.id.should == 1
+    o.abc.should == [1]
+    o.abc.should == [1]
+    o.def.should == ["hello"]
+    o.def.should == ["hello"]
+    
+    o.update(:abc => [23])
+    @c.create(:abc => [1,2,3])
+    
+    MODEL_DB.sqls.should == ["UPDATE items SET abc = '#{JSON.generate([23])}' WHERE (id = 1)",
+      "INSERT INTO items (abc) VALUES ('#{JSON.generate([1,2,3])}')"]
+  end
 
   it "should copy serialization formats and columns to subclasses" do
     @c.set_primary_key :id
@@ -142,5 +182,28 @@ describe "Serialization plugin" do
     o = @c.load(:id => 1, :abc => "--- 1\n", :def => "--- hello\n")
     lambda{o.send(:serialize_value, :abc, 1)}.should raise_error(Sequel::Error)
     lambda{o.send(:deserialize_value, :abc, "--- hello\n")}.should raise_error(Sequel::Error)
+  end
+
+  it "should add the accessors to a module included in the class, so they can be easily overridden" do
+    @c.class_eval do
+      def abc
+        "#{super}-blah"
+      end
+    end
+    @c.plugin :serialization, :yaml, :abc
+    o = @c.load(:abc => "--- 1\n")
+    o.abc.should == "1-blah"
+  end
+
+  it "should call super to get the deserialized value from a previous accessor" do
+    m = Module.new do
+      def abc
+        "--- #{@values[:abc]*3}\n"
+      end
+    end
+    @c.send(:include, m)
+    @c.plugin :serialization, :yaml, :abc
+    o = @c.load(:abc => 3)
+    o.abc.should == 9
   end
 end

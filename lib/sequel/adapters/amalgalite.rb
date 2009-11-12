@@ -29,7 +29,7 @@ module Sequel
       
       # Return datetime types as instances of Sequel.datetime_class
       def datetime(s)
-        Sequel.string_to_datetime(s)
+        Sequel.database_to_application_timestamp(s)
       end
       
       # Don't raise an error if the value is a string and the declared
@@ -82,9 +82,9 @@ module Sequel
         Amalgalite::Dataset.new(self, opts)
       end
       
-      # Run the given SQL with the given arguments and reload the schema.  Returns nil.
+      # Run the given SQL with the given arguments. Returns nil.
       def execute_ddl(sql, opts={})
-        _execute(sql, opts){|conn| conn.execute_batch(sql); conn.reload_schema!}
+        _execute(sql, opts){|conn| conn.execute_batch(sql);}
         nil
       end
       
@@ -99,19 +99,8 @@ module Sequel
       end
       
       # Run the given SQL with the given arguments and yield each row.
-      def execute(sql, opts={})
-        retried = false
-        _execute(sql, opts) do |conn|
-          conn.prepare(sql) do |stmt|
-            begin
-             stmt.result_meta
-            rescue NoMethodError
-              conn.reload_schema!
-              stmt.result_meta
-            end
-            yield stmt
-          end
-        end
+      def execute(sql, opts={}, &block)
+        _execute(sql, opts){|conn| conn.prepare(sql, &block)}
       end
       
       # Run the given SQL with the given arguments and return the first value of the first row.
@@ -158,20 +147,9 @@ module Sequel
     class Dataset < Sequel::Dataset
       include ::Sequel::SQLite::DatasetMethods
       
-      EXPLAIN = 'EXPLAIN %s'.freeze
-      
-      # Return an array of strings specifying a query explanation for the
-      # current dataset.
-      def explain
-        res = []
-        @db.result_set(EXPLAIN % select_sql(opts), nil) {|r| res << r}
-        res
-      end
-      
       # Yield a hash for each row in the dataset.
       def fetch_rows(sql)
         execute(sql) do |stmt|
-          stmt.result_meta
           @columns = cols = stmt.result_fields.map{|c| output_identifier(c)}
           col_count = cols.size
           stmt.each do |result|
@@ -186,7 +164,7 @@ module Sequel
       
       # Quote the string using the adapter instance method.
       def literal_string(v)
-        "#{db.synchronize{|c| c.quote(v)}}"
+        db.synchronize{|c| c.quote(v)}
       end
     end
   end

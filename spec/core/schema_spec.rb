@@ -107,16 +107,18 @@ context "DB#create_table" do
     @db.create_table(:cats) do
       integer :id
       text :name, :null => false
+      text :name2, :allow_null => false
     end
-    @db.sqls.should == ["CREATE TABLE cats (id integer, name text NOT NULL)"]
+    @db.sqls.should == ["CREATE TABLE cats (id integer, name text NOT NULL, name2 text NOT NULL)"]
   end
   
   specify "should accept null definition" do
     @db.create_table(:cats) do
       integer :id
       text :name, :null => true
+      text :name2, :allow_null => true
     end
-    @db.sqls.should == ["CREATE TABLE cats (id integer, name text NULL)"]
+    @db.sqls.should == ["CREATE TABLE cats (id integer, name text NULL, name2 text NULL)"]
   end
   
   specify "should accept unique definition" do
@@ -744,9 +746,6 @@ context "Schema Parser" do
     @sqls = []
     @db = Sequel::Database.new
   end
-  after do
-    Sequel.convert_tinyint_to_bool = true
-  end
 
   specify "should raise an error if there are no columns" do
     @db.meta_def(:schema_parse_table) do |t, opts|
@@ -762,11 +761,11 @@ context "Schema Parser" do
       sqls << t
       [[:a, {:db_type=>t.to_s}]]
     end
-    @db.schema(:x).should == [[:a, {:db_type=>"x"}]]
+    @db.schema(:x).should == [[:a, {:db_type=>"x", :ruby_default=>nil}]]
     @sqls.should == ['x']
-    @db.schema(:x).should == [[:a, {:db_type=>"x"}]]
+    @db.schema(:x).should == [[:a, {:db_type=>"x", :ruby_default=>nil}]]
     @sqls.should == ['x']
-    @db.schema(:x, :reload=>true).should == [[:a, {:db_type=>"x"}]]
+    @db.schema(:x, :reload=>true).should == [[:a, {:db_type=>"x", :ruby_default=>nil}]]
     @sqls.should == ['x', 'x']
   end
 
@@ -775,11 +774,11 @@ context "Schema Parser" do
       [[t, {:db_type=>t}]]
     end
     s1 = @db.schema(:x)
-    s1.should == [['x', {:db_type=>'x'}]]
+    s1.should == [['x', {:db_type=>'x', :ruby_default=>nil}]]
     @db.schema(:x).object_id.should == s1.object_id
     @db.schema(:x.identifier).object_id.should == s1.object_id
     s2 = @db.schema(:x__y)
-    s2.should == [['y', {:db_type=>'y'}]]
+    s2.should == [['y', {:db_type=>'y', :ruby_default=>nil}]]
     @db.schema(:x__y).object_id.should == s2.object_id
     @db.schema(:y.qualify(:x)).object_id.should == s2.object_id
   end
@@ -788,9 +787,7 @@ context "Schema Parser" do
     @db.meta_def(:schema_parse_table) do |t, opts|
       [[:x, {:type=>schema_column_type(t.to_s)}]]
     end
-    @db.schema(:tinyint).first.last[:type].should == :boolean
-    Sequel.convert_tinyint_to_bool = false
-    @db.schema(:tinyint, :reload=>true).first.last[:type].should == :integer
+    @db.schema(:tinyint).first.last[:type].should == :integer
     @db.schema(:interval).first.last[:type].should == :interval
     @db.schema(:int).first.last[:type].should == :integer
     @db.schema(:integer).first.last[:type].should == :integer
@@ -810,6 +807,7 @@ context "Schema Parser" do
     @db.schema(:"time with time zone").first.last[:type].should == :time
     @db.schema(:"time without time zone").first.last[:type].should == :time
     @db.schema(:boolean).first.last[:type].should == :boolean
+    @db.schema(:bit).first.last[:type].should == :boolean
     @db.schema(:real).first.last[:type].should == :float
     @db.schema(:float).first.last[:type].should == :float
     @db.schema(:double).first.last[:type].should == :float
@@ -818,5 +816,15 @@ context "Schema Parser" do
     @db.schema(:decimal).first.last[:type].should == :decimal
     @db.schema(:money).first.last[:type].should == :decimal
     @db.schema(:bytea).first.last[:type].should == :blob
+    @db.schema(:blob).first.last[:type].should == :blob
+    @db.schema(:image).first.last[:type].should == :blob
+    @db.schema(:nchar).first.last[:type].should == :string
+    @db.schema(:nvarchar).first.last[:type].should == :string
+    @db.schema(:ntext).first.last[:type].should == :string
+    @db.schema(:smalldatetime).first.last[:type].should == :datetime
+    @db.schema(:smallmoney).first.last[:type].should == :decimal
+    @db.schema(:binary).first.last[:type].should == :blob
+    @db.schema(:varbinary).first.last[:type].should == :blob
+    @db.schema(:enum).first.last[:type].should == :enum
   end
 end

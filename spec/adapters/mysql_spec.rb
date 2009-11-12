@@ -65,48 +65,52 @@ context "MySQL", '#create_table' do
 end
 
 context "A MySQL database" do
-  before do
-    @db = MYSQL_DB
-    @db.create_table(:booltest){TrueClass :value}
-  end
-  after do
-    Sequel.convert_tinyint_to_bool = true
-    @db.drop_table(:booltest)
-  end
-
   specify "should provide the server version" do
-    @db.server_version.should >= 40000
+    MYSQL_DB.server_version.should >= 40000
   end
+end
 
-  specify "should correctly parse the schema" do
-    @db.schema(:booltest, :reload=>true).should == [[:value, {:type=>:boolean, :allow_null=>true, :primary_key=>false, :default=>nil, :db_type=>"tinyint(4)"}]]
+if MYSQL_DB.class.adapter_scheme == :mysql
+  context "Sequel::MySQL.convert_tinyint_to_bool" do
+    before do
+      @db = MYSQL_DB
+      @db.create_table(:booltest){column :b, 'tinyint(1)'; column :i, 'tinyint(4)'}
+      @ds = @db[:booltest]
+    end
+    after do
+      Sequel::MySQL.convert_tinyint_to_bool = true
+      @db.drop_table(:booltest)
+    end
     
-    Sequel.convert_tinyint_to_bool = false
-    @db.schema(:booltest, :reload=>true).should == [[:value, {:type=>:integer, :allow_null=>true, :primary_key=>false, :default=>nil, :db_type=>"tinyint(4)"}]]
-  end
-  
-  specify "should accept and return tinyints as bools or integers when configured to do so" do
-    MYSQL_DB[:booltest].delete
-    MYSQL_DB[:booltest] << {:value=>true}
-    MYSQL_DB[:booltest].all.should == [{:value=>true}]
-    MYSQL_DB[:booltest].delete
-    MYSQL_DB[:booltest] << {:value=>false}
-    MYSQL_DB[:booltest].all.should == [{:value=>false}]
+    specify "should consider tinyint(1) datatypes as boolean if set, but not larger tinyints" do
+      @db.schema(:booltest, :reload=>true).should == [[:b, {:type=>:boolean, :allow_null=>true, :primary_key=>false, :default=>nil, :ruby_default=>nil, :db_type=>"tinyint(1)"}, ], [:i, {:type=>:integer, :allow_null=>true, :primary_key=>false, :default=>nil, :ruby_default=>nil, :db_type=>"tinyint(4)"}, ]]
+      Sequel::MySQL.convert_tinyint_to_bool = false
+      @db.schema(:booltest, :reload=>true).should == [[:b, {:type=>:integer, :allow_null=>true, :primary_key=>false, :default=>nil, :ruby_default=>nil, :db_type=>"tinyint(1)"}, ], [:i, {:type=>:integer, :allow_null=>true, :primary_key=>false, :default=>nil, :ruby_default=>nil, :db_type=>"tinyint(4)"}, ]]
+    end
     
-    Sequel.convert_tinyint_to_bool = false
-    MYSQL_DB[:booltest].delete
-    MYSQL_DB[:booltest] << {:value=>true}
-    MYSQL_DB[:booltest].all.should == [{:value=>1}]
-    MYSQL_DB[:booltest].delete
-    MYSQL_DB[:booltest] << {:value=>false}
-    MYSQL_DB[:booltest].all.should == [{:value=>0}]
-    
-    MYSQL_DB[:booltest].delete
-    MYSQL_DB[:booltest] << {:value=>1}
-    MYSQL_DB[:booltest].all.should == [{:value=>1}]
-    MYSQL_DB[:booltest].delete
-    MYSQL_DB[:booltest] << {:value=>0}
-    MYSQL_DB[:booltest].all.should == [{:value=>0}]
+    specify "should return tinyints as bools when set" do
+      @ds.delete
+      @ds << {:b=>true, :i=>10}
+      @ds.all.should == [{:b=>true, :i=>true}]
+      @ds.delete
+      @ds << {:b=>false, :i=>0}
+      @ds.all.should == [{:b=>false, :i=>false}]
+      
+      Sequel::MySQL.convert_tinyint_to_bool = false
+      @ds.delete
+      @ds << {:b=>true, :i=>10}
+      @ds.all.should == [{:b=>1, :i=>10}]
+      @ds.delete
+      @ds << {:b=>false, :i=>0}
+      @ds.all.should == [{:b=>0, :i=>0}]
+      
+      @ds.delete
+      @ds << {:b=>1, :i=>10}
+      @ds.all.should == [{:b=>1, :i=>10}]
+      @ds.delete
+      @ds << {:b=>0, :i=>0}
+      @ds.all.should == [{:b=>0, :i=>0}]
+    end
   end
 end
 
@@ -411,7 +415,7 @@ context "A MySQL database" do
   
   specify "should support defaults for boolean columns" do
     @db.create_table(:items){TrueClass :active1, :default=>true; FalseClass :active2, :default => false}
-    @db.sqls.should == ["CREATE TABLE items (active1 tinyint DEFAULT 1, active2 tinyint DEFAULT 0)"]
+    @db.sqls.should == ["CREATE TABLE items (active1 tinyint(1) DEFAULT 1, active2 tinyint(1) DEFAULT 0)"]
   end
   
   specify "should correctly format CREATE TABLE statements with foreign keys" do
@@ -426,11 +430,11 @@ context "A MySQL database" do
   end
   
   specify "should have rename_column support keep existing options" do
-    @db.create_table(:items){Integer :id, :null=>false, :default=>5}
+    @db.create_table(:items){String :id, :null=>false, :default=>'blah'}
     @db.alter_table(:items){rename_column :id, :nid}
-    @db.sqls.should == ["CREATE TABLE items (id integer NOT NULL DEFAULT 5)", "DESCRIBE items", "ALTER TABLE items CHANGE COLUMN id nid int(11) NOT NULL DEFAULT 5"]
+    @db.sqls.should == ["CREATE TABLE items (id varchar(255) NOT NULL DEFAULT 'blah')", "DESCRIBE items", "ALTER TABLE items CHANGE COLUMN id nid varchar(255) NOT NULL DEFAULT 'blah'"]
     @db[:items].insert
-    @db[:items].all.should == [{:nid=>5}]
+    @db[:items].all.should == [{:nid=>'blah'}]
     proc{@db[:items].insert(:nid=>nil)}.should raise_error(Sequel::DatabaseError)
   end
   
@@ -444,6 +448,12 @@ context "A MySQL database" do
     @db[:items].delete
     @db[:items].insert(2**40)
     @db[:items].all.should == [{:id=>2**40}]
+  end
+
+  specify "should have set_column_type pass through options" do
+    @db.create_table(:items){integer :id; enum :list, :elements=>%w[one]}
+    @db.alter_table(:items){set_column_type :id, :int, :unsigned=>true, :size=>8; set_column_type :list, :enum, :elements=>%w[two]}
+    @db.sqls.should == ["CREATE TABLE items (id integer, list enum('one'))", "DESCRIBE items", "ALTER TABLE items CHANGE COLUMN id id int(8) UNSIGNED NULL", "ALTER TABLE items CHANGE COLUMN list list enum('two') NULL"]
   end
   
   specify "should have set_column_default support keep existing options" do
@@ -474,14 +484,6 @@ context "A MySQL database" do
     
     @db << 'DELETE FROM items'
     @db[:items].first.should == nil
-  end
-  
-  specify "should handle multiple select statements at once" do
-    @db.create_table(:items){String :name; Integer :value}
-    @db[:items].delete
-    @db[:items].insert(:name => 'tutu', :value => 1234)
-    @db["SELECT * FROM items; SELECT * FROM items"].all.should == \
-      [{:name => 'tutu', :value => 1234}, {:name => 'tutu', :value => 1234}]
   end
 end  
 
@@ -785,6 +787,25 @@ context "MySQL::Dataset#replace" do
     MYSQL_DB.drop_table(:items)
   end
   
+  specify "should use default values if they exist" do
+    MYSQL_DB.alter_table(:items){set_column_default :id, 1; set_column_default :value, 2}
+    @d.replace
+    @d.all.should == [{:id=>1, :value=>2}]
+    @d.replace([])
+    @d.all.should == [{:id=>1, :value=>2}]
+    @d.replace({})
+    @d.all.should == [{:id=>1, :value=>2}]
+  end
+  
+  specify "should use support arrays, datasets, and multiple values" do
+    @d.replace([1, 2])
+    @d.all.should == [{:id=>1, :value=>2}]
+    @d.replace(1, 2)
+    @d.all.should == [{:id=>1, :value=>2}]
+    @d.replace(@d)
+    @d.all.should == [{:id=>1, :value=>2}]
+  end
+  
   specify "should create a record if the condition is not met" do
     @d.replace(:id => 111, :value => 333)
     @d.all.should == [{:id => 111, :value => 333}]
@@ -900,6 +921,46 @@ if MYSQL_DB.class.adapter_scheme == :mysql
       MYSQL_DB["SELECT CAST('0000-00-00' AS date)"].single_value.should == '0000-00-00'
       MYSQL_DB["SELECT CAST('0000-00-00 00:00:00' AS datetime)"].single_value.should == '0000-00-00 00:00:00'
       MYSQL_DB["SELECT CAST('25:00:00' AS time)"].single_value.should == '25:00:00'
+    end
+  end
+  
+  context "MySQL multiple result sets" do
+    before do
+      MYSQL_DB.create_table!(:a){Integer :a}
+      MYSQL_DB.create_table!(:b){Integer :b}
+      @ds = MYSQL_DB['SELECT * FROM a; SELECT * FROM b']
+      MYSQL_DB[:a].insert(10)
+      MYSQL_DB[:a].insert(15)
+      MYSQL_DB[:b].insert(20)
+      MYSQL_DB[:b].insert(25)
+    end
+    after do
+      MYSQL_DB.drop_table(:a, :b)
+    end
+    
+    specify "should combine all results by default" do
+      @ds.all.should == [{:a=>10}, {:a=>15}, {:b=>20}, {:b=>25}]
+    end
+    
+    specify "should split results returned into arrays if split_multiple_result_sets is used" do
+      @ds.split_multiple_result_sets.all.should == [[{:a=>10}, {:a=>15}], [{:b=>20}, {:b=>25}]]
+    end
+    
+    specify "should have regular row_procs work when splitting multiple result sets" do
+      @ds.row_proc = proc{|x| x[x.keys.first] *= 2; x}
+      @ds.split_multiple_result_sets.all.should == [[{:a=>20}, {:a=>30}], [{:b=>40}, {:b=>50}]]
+    end
+    
+    specify "should use the columns from the first result set when splitting result sets" do
+      @ds.split_multiple_result_sets.columns.should == [:a]
+    end
+    
+    specify "should not allow graphing a dataset that splits multiple statements" do
+      proc{@ds.split_multiple_result_sets.graph(:b, :b=>:a)}.should raise_error(Sequel::Error)
+    end
+    
+    specify "should not allow splitting a graphed dataset" do
+      proc{MYSQL_DB[:a].graph(:b, :b=>:a).split_multiple_result_sets}.should raise_error(Sequel::Error)
     end
   end
 end

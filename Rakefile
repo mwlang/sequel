@@ -168,11 +168,25 @@ begin
     t.spec_opts  = spec_opts.call
   end
   
-  %w'postgres sqlite mysql informix oracle ado'.each do |adapter|
-    desc "Run #{adapter} specs without coverage"
+  desc "Run integration tests with coverage"
+  Spec::Rake::SpecTask.new("integration_cov") do |t|
+    t.spec_files = Dir["spec/integration/*_test.rb"]
+    t.spec_opts  = spec_opts.call
+    t.rcov, t.rcov_opts = rcov_opts.call
+  end
+  
+  %w'postgres sqlite mysql informix oracle firebird mssql'.each do |adapter|
+    desc "Run #{adapter} specs"
     Spec::Rake::SpecTask.new("spec_#{adapter}") do |t|
       t.spec_files = ["spec/adapters/#{adapter}_spec.rb"] + Dir["spec/integration/*_test.rb"]
       t.spec_opts  = spec_opts.call
+    end
+
+    desc "Run #{adapter} specs with coverage"
+    Spec::Rake::SpecTask.new("spec_#{adapter}_cov") do |t|
+      t.spec_files = ["spec/adapters/#{adapter}_spec.rb"] + Dir["spec/integration/*_test.rb"]
+      t.spec_opts  = spec_opts.call
+      t.rcov, t.rcov_opts = rcov_opts.call
     end
   end
 rescue LoadError
@@ -196,4 +210,9 @@ end
 desc "Print Sequel version"
 task :version do
   puts VERS.call
+end
+
+desc "Check syntax of all .rb files"
+task :check_syntax do
+  Dir['**/*.rb'].each{|file| print `#{ENV['RUBY'] || :ruby} -c #{file} | fgrep -v "Syntax OK"`}
 end

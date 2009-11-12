@@ -1,10 +1,6 @@
-Sequel.require %w'savepoint_transactions unsupported', 'adapters/utils'
-
 module Sequel
   module SQLite
     module DatabaseMethods
-      include Sequel::Database::SavepointTransactions
-
       AUTO_VACUUM = [:none, :full, :incremental].freeze
       PRIMARY_KEY_INDEX_RE = /\Asqlite_autoindex_/.freeze
       SYNCHRONOUS = [:off, :normal, :full].freeze
@@ -14,7 +10,9 @@ module Sequel
       # Run all alter_table commands in a transaction.  This is technically only
       # needed for drop column.
       def alter_table(name, generator=nil, &block)
-        transaction{super}
+        remove_cached_schema(name)
+        generator ||= Schema::AlterTableGenerator.new(self, &block)
+        transaction{generator.operations.each{|op| alter_table_sql_list(name, [op]).flatten.each{|sql| execute_ddl(sql)}}}
       end
 
       # A symbol signifying the value of the auto_vacuum PRAGMA.
@@ -67,6 +65,11 @@ module Sequel
         execute_ddl("PRAGMA #{name} = #{value}")
       end
       
+      # SQLite supports savepoints
+      def supports_savepoints?
+        true
+      end
+
       # A symbol signifying the value of the synchronous PRAGMA.
       def synchronous
         SYNCHRONOUS[pragma_get(:synchronous).to_i]
@@ -106,48 +109,26 @@ module Sequel
       # the column inside of a transaction.
       def alter_table_sql(table, op)
         case op[:op]
-        when :add_column, :add_index, :drop_index
+        when :add_index, :drop_index
           super
-        when :drop_column
-          qt = quote_schema_table(table)
-          bt = quote_identifier(backup_table_name(qt.gsub('`', '')))
-          columns_str = dataset.send(:identifier_list, columns_for(table, :except => op[:name]))
-          defined_columns_str = column_list_sql(defined_columns_for(table, :except => op[:name]))
-          ["CREATE TEMPORARY TABLE #{bt}(#{defined_columns_str})",
-           "INSERT INTO #{bt} SELECT #{columns_str} FROM #{qt}",
-           "DROP TABLE #{qt}",
-           "CREATE TABLE #{qt}(#{defined_columns_str})",
-           "INSERT INTO #{qt} SELECT #{columns_str} FROM #{bt}",
-           "DROP TABLE #{bt}"]
-        when :rename_column
-          qt = quote_schema_table(table)
-          bt = quote_identifier(backup_table_name(qt.gsub('`', '')))
-          old_columns = dataset.send(:identifier_list, columns_for(table))
-          new_columns_arr = columns_for(table)
-
-          # Replace the old column in place. This is extremely important.
-          new_columns_arr[new_columns_arr.index(op[:name])] = op[:new_name]
-          
-          new_columns = dataset.send(:identifier_list, new_columns_arr)
-          
-          def_old_columns = column_list_sql(defined_columns_for(table))
-
-          def_new_columns_arr = defined_columns_for(table).map do |c|
-            c[:name] = op[:new_name].to_s if c[:name] == op[:name].to_s
-            c
+        when :add_column
+          if op[:unique] || op[:primary_key]
+            duplicate_table(table){|columns| columns.push(op)}
+          else
+            super
           end
-          
-          def_new_columns = column_list_sql(def_new_columns_arr)
-
-          [
-           "CREATE TEMPORARY TABLE #{bt}(#{def_old_columns})",
-           "INSERT INTO #{bt}(#{old_columns}) SELECT #{old_columns} FROM #{qt}",
-           "DROP TABLE #{qt}",
-           "CREATE TABLE #{qt}(#{def_new_columns})",
-           "INSERT INTO #{qt}(#{new_columns}) SELECT #{old_columns} FROM #{bt}",
-           "DROP TABLE #{bt}"
-          ]
-
+        when :drop_column
+          ocp = lambda{|oc| oc.delete_if{|c| c.to_s == op[:name].to_s}}
+          duplicate_table(table, :old_columns_proc=>ocp){|columns| columns.delete_if{|s| s[:name].to_s == op[:name].to_s}}
+        when :rename_column
+          ncp = lambda{|nc| nc.map!{|c| c.to_s == op[:name].to_s ? op[:new_name] : c}}
+          duplicate_table(table, :new_columns_proc=>ncp){|columns| columns.each{|s| s[:name] = op[:new_name] if s[:name].to_s == op[:name].to_s}}
+        when :set_column_default
+          duplicate_table(table){|columns| columns.each{|s| s[:default] = op[:default] if s[:name].to_s == op[:name].to_s}}
+        when :set_column_null
+          duplicate_table(table){|columns| columns.each{|s| s[:null] = op[:null] if s[:name].to_s == op[:name].to_s}}
+        when :set_column_type
+          duplicate_table(table){|columns| columns.each{|s| s[:type] = op[:type] if s[:name].to_s == op[:name].to_s}}
         else
           raise Error, "Unsupported ALTER TABLE operation"
         end
@@ -155,17 +136,11 @@ module Sequel
       
       # The array of column symbols in the table, except for ones given in opts[:except]
       def backup_table_name(table, opts={})
+        table = table.gsub('`', '')
         (opts[:times]||1000).times do |i|
           table_name = "#{table}_backup#{i}"
           return table_name unless table_exists?(table_name)
         end
-      end
-
-      # The array of column symbols in the table, except for ones given in opts[:except]
-      def columns_for(table, opts={})
-        cols = schema_parse_table(table, {}).map{|c| c[0]}
-        cols = cols - Array(opts[:except])
-        cols
       end
 
       # Allow use without a generator, needed for the alter table hackery that Sequel allows.
@@ -176,7 +151,10 @@ module Sequel
       # The array of column schema hashes, except for the ones given in opts[:except]
       def defined_columns_for(table, opts={})
         cols = parse_pragma(table, {})
-        cols.each{|c| c[:default] = LiteralString.new(c[:default]) if c[:default]}
+        cols.each do |c|
+          c[:default] = LiteralString.new(c[:default]) if c[:default]
+          c[:type] = c[:db_type]
+        end
         if opts[:except]
           nono= Array(opts[:except]).compact.map{|n| n.to_s}
           cols.reject!{|c| nono.include? c[:name] }
@@ -184,6 +162,30 @@ module Sequel
         cols
       end
       
+      # Duplicate an existing table by creating a new table, copying all records
+      # from the existing table into the new table, deleting the existing table
+      # and renaming the new table to the existing table's name.
+      def duplicate_table(table, opts={})
+        remove_cached_schema(table)
+        def_columns = defined_columns_for(table)
+        old_columns = def_columns.map{|c| c[:name]}
+        opts[:old_columns_proc].call(old_columns) if opts[:old_columns_proc]
+
+        yield def_columns if block_given?
+        def_columns_str = column_list_sql(def_columns)
+        new_columns = old_columns.dup
+        opts[:new_columns_proc].call(new_columns) if opts[:new_columns_proc]
+
+        qt = quote_schema_table(table)
+        bt = quote_identifier(backup_table_name(qt))
+        [
+           "CREATE TABLE #{bt}(#{def_columns_str})",
+           "INSERT INTO #{bt}(#{dataset.send(:identifier_list, new_columns)}) SELECT #{dataset.send(:identifier_list, old_columns)} FROM #{qt}",
+           "DROP TABLE #{qt}",
+           "ALTER TABLE #{bt} RENAME TO #{qt}"
+        ]
+      end
+
       # SQLite folds unquoted identifiers to lowercase, so it shouldn't need to upcase identifiers on input.
       def identifier_input_method_default
         nil
@@ -233,9 +235,9 @@ module Sequel
     
     # Instance methods for datasets that connect to an SQLite database
     module DatasetMethods
-      include Dataset::UnsupportedIntersectExceptAll
-      include Dataset::UnsupportedIsTrue
-
+      SELECT_CLAUSE_METHODS = Dataset.clause_methods(:select, %w'distinct columns from join where group having compounds order limit')
+      CONSTANT_MAP = {:CURRENT_DATE=>"date(CURRENT_TIMESTAMP, 'localtime')".freeze, :CURRENT_TIMESTAMP=>"datetime(CURRENT_TIMESTAMP, 'localtime')".freeze, :CURRENT_TIME=>"time(CURRENT_TIMESTAMP, 'localtime')".freeze}
+    
       # SQLite does not support pattern matching via regular expressions.
       # SQLite is case insensitive (depending on pragma), so use LIKE for
       # ILIKE.
@@ -251,6 +253,11 @@ module Sequel
         end
       end
       
+      # MSSQL doesn't support the SQL standard CURRENT_DATE or CURRENT_TIME
+      def constant_sql(constant)
+        CONSTANT_MAP[constant] || super
+      end
+      
       # SQLite performs a TRUNCATE style DELETE if no filter is specified.
       # Since we want to always return the count of records, add a condition
       # that is always true and then delete.
@@ -258,18 +265,17 @@ module Sequel
         @opts[:where] ? super : filter(1=>1).delete
       end
       
-      # Insert the values into the database.
-      def insert(*values)
-        execute_insert(insert_sql(*values))
+      # Return an array of strings specifying a query explanation for a SELECT of the
+      # current dataset.
+      def explain
+        db.send(:metadata_dataset).clone(:sql=>"EXPLAIN #{select_sql}").
+          map{|x| "#{x[:addr]}|#{x[:opcode]}|#{(1..5).map{|i| x[:"p#{i}"]}.join('|')}|#{x[:comment]}"}
       end
       
-      # Allow inserting of values directly from a dataset.
-      def insert_sql(*values)
-        if (values.size == 1) && values.first.is_a?(Sequel::Dataset)
-          "#{insert_sql_base}#{source_list(@opts[:from])} #{values.first.sql};"
-        else
-          super(*values)
-        end
+      # HAVING requires GROUP BY on SQLite
+      def having(*cond, &block)
+        raise(InvalidOperation, "Can only specify a HAVING clause on a grouped dataset") unless @opts[:group]
+        super
       end
       
       # SQLite uses the nonstandard ` (backtick) for quoting identifiers.
@@ -277,18 +283,50 @@ module Sequel
         "`#{c}`"
       end
       
-      private
+      # SQLite does not support INTERSECT ALL or EXCEPT ALL
+      def supports_intersect_except_all?
+        false
+      end
 
+      # SQLite does not support IS TRUE
+      def supports_is_true?
+        false
+      end
+      
+      # SQLite does not support multiple columns for the IN/NOT IN operators
+      def supports_multiple_column_in?
+        false
+      end
+      
+      # SQLite supports timezones in literal timestamps, since it stores them
+      # as text.
+      def supports_timestamp_timezones?
+        true
+      end
+
+      private
+      
+      # SQLite uses string literals instead of identifiers in AS clauses.
+      def as_sql(expression, aliaz)
+        aliaz = aliaz.value if aliaz.is_a?(SQL::Identifier)
+        "#{expression} AS #{literal(aliaz.to_s)}"
+      end
+      
+      # SQLite uses a preceding X for hex escaping strings
       def literal_blob(v)
         blob = ''
         v.each_byte{|x| blob << sprintf('%02x', x)}
         "X'#{blob}'"
       end
       
-      # SQLite uses string literals instead of identifiers in AS clauses.
-      def as_sql(expression, aliaz)
-        aliaz = aliaz.value if aliaz.is_a?(SQL::Identifier)
-        "#{expression} AS #{literal(aliaz.to_s)}"
+      # SQLite does not support the SQL WITH clause
+      def select_clause_methods
+        SELECT_CLAUSE_METHODS
+      end
+      
+      # SQLite treats a DELETE with no WHERE clause as a TRUNCATE
+      def _truncate_sql(table)
+        "DELETE FROM #{table}"
       end
     end
   end

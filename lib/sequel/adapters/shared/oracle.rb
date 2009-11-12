@@ -1,5 +1,3 @@
-Sequel.require %w'date_format unsupported', 'adapters/utils'
-
 module Sequel
   module Oracle
     module DatabaseMethods
@@ -96,25 +94,42 @@ module Sequel
     end
     
     module DatasetMethods
-      include Dataset::UnsupportedIntersectExceptAll
-      include Dataset::SQLStandardDateFormat
-
-      SELECT_CLAUSE_ORDER = %w'distinct columns from join where group having compounds order limit'.freeze
-
-      # Oracle doesn't support DISTINCT ON
-      def distinct(*columns)
-        raise(Error, "DISTINCT ON not supported by Oracle") unless columns.empty?
-        super
-      end
+      SELECT_CLAUSE_METHODS = Dataset.clause_methods(:select, %w'with distinct columns from join where group having compounds order limit')
 
       # Oracle uses MINUS instead of EXCEPT, and doesn't support EXCEPT ALL
-      def except(dataset, all = false)
-        raise(Sequel::Error, "EXCEPT ALL not supported") if all
-        compound_clone(:minus, dataset, all)
+      def except(dataset, opts={})
+        opts = {:all=>opts} unless opts.is_a?(Hash)
+        raise(Sequel::Error, "EXCEPT ALL not supported") if opts[:all]
+        compound_clone(:minus, dataset, opts)
       end
 
       def empty?
         db[:dual].where(exists).get(1) == nil
+      end
+
+      # Oracle requires SQL standard datetimes
+      def requires_sql_standard_datetimes?
+        true
+      end
+
+      # Oracle does not support DISTINCT ON
+      def supports_distinct_on?
+        false
+      end
+
+      # Oracle does not support INTERSECT ALL or EXCEPT ALL
+      def supports_intersect_except_all?
+        false
+      end
+      
+      # Oracle supports timezones in literal timestamps.
+      def supports_timestamp_timezones?
+        true
+      end
+      
+      # Oracle supports window functions
+      def supports_window_functions?
+        true
       end
 
       private
@@ -125,13 +140,31 @@ module Sequel
         "#{expression} #{quote_identifier(aliaz)}"
       end
 
+      # The strftime format to use when literalizing the time.
+      def default_timestamp_format
+        "TIMESTAMP '%Y-%m-%d %H:%M:%S%N %z'".freeze
+      end
+
+      # Use a colon for the timestamp offset, since Oracle appears to require it.
+      def format_timestamp_offset(hour, minute)
+        sprintf("%+03i:%02i", hour, minute)
+      end
+
       # Oracle uses the SQL standard of only doubling ' inside strings.
       def literal_string(v)
         "'#{v.gsub("'", "''")}'"
       end
 
-      def select_clause_order
-        SELECT_CLAUSE_ORDER
+      def select_clause_methods
+        SELECT_CLAUSE_METHODS
+      end
+
+      # Modify the SQL to add the list of tables to select FROM
+      # Oracle doesn't support select without FROM clause
+      # so add the dummy DUAL table if the dataset doesn't select
+      # from a table.
+      def select_from_sql(sql)
+        sql << " FROM #{source_list(@opts[:from] || ['DUAL'])}"
       end
 
       # Oracle requires a subselect to do limit and offset

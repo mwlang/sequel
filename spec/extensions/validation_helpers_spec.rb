@@ -55,6 +55,13 @@ describe "Sequel::Plugins::ValidationHelpers" do
     @m.value = '1_1'
     @m.should be_valid
   end
+  
+  specify "should allow a proc for the :message option" do
+    @c.set_validations{validates_format(/.+_.+/, :value, :message=>proc{|f| "doesn't match #{f.inspect}"})}
+    @m.value = 'abc_'
+    @m.should_not be_valid
+    @m.errors.should == {:value=>["doesn't match /.+_.+/"]}
+  end
 
   specify "should take multiple attributes in the same call" do
     @c.columns :value, :value2
@@ -64,6 +71,70 @@ describe "Sequel::Plugins::ValidationHelpers" do
     @m.should_not be_valid
     @m.value2 = 1
     @m.should be_valid
+  end
+  
+  specify "should support modifying default options for all models" do
+    @c.set_validations{validates_presence(:value)}
+    @m.should_not be_valid
+    @m.errors.should == {:value=>['is not present']}
+    o = Sequel::Plugins::ValidationHelpers::DEFAULT_OPTIONS[:presence].dup
+    Sequel::Plugins::ValidationHelpers::DEFAULT_OPTIONS[:presence][:message] = lambda{"was not entered"}
+    @m.should_not be_valid
+    @m.errors.should == {:value=>["was not entered"]}
+    @m.value = 1
+    @m.should be_valid
+    
+    @m.values.clear
+    Sequel::Plugins::ValidationHelpers::DEFAULT_OPTIONS[:presence][:allow_missing] = true
+    @m.should be_valid
+    @m.value = nil
+    @m.should_not be_valid
+    @m.errors.should == {:value=>["was not entered"]}
+
+    
+    c = Class.new(Sequel::Model)
+    c.class_eval do
+      plugin :validation_helpers
+      set_columns([:value])
+      def validate
+        validates_presence(:value)
+      end
+    end
+    m = c.new(:value=>nil)
+    m.should_not be_valid
+    m.errors.should == {:value=>["was not entered"]}
+    Sequel::Plugins::ValidationHelpers::DEFAULT_OPTIONS[:presence] = o
+  end
+  
+  specify "should support modifying default validation options for a particular model" do
+    @c.set_validations{validates_presence(:value)}
+    @m.should_not be_valid
+    @m.errors.should == {:value=>['is not present']}
+    @c.class_eval do
+      def default_validation_helpers_options(type)
+        {:allow_missing=>true, :message=>proc{'was not entered'}}
+      end
+    end
+    @m.value = nil
+    @m.should_not be_valid
+    @m.errors.should == {:value=>["was not entered"]}
+    @m.value = 1
+    @m.should be_valid
+    
+    @m.values.clear
+    @m.should be_valid
+    
+    c = Class.new(Sequel::Model)
+    c.class_eval do
+      plugin :validation_helpers
+      attr_accessor :value
+      def validate
+        validates_presence(:value)
+      end
+    end
+    m = c.new
+    m.should_not be_valid
+    m.errors.should == {:value=>['is not present']}
   end
 
   specify "should support validates_exact_length" do
@@ -287,5 +358,23 @@ describe "Sequel::Plugins::ValidationHelpers" do
     @user = @c.new(:username => "0records", :password => "anothertest")
     @user.should be_valid
     MODEL_DB.sqls.last.should == "SELECT COUNT(*) AS count FROM items WHERE ((username = '0records') AND (password = 'anothertest')) LIMIT 1"
+  end
+
+  it "should support validates_unique with a block" do
+    @c.columns(:id, :username, :password)
+    @c.set_dataset MODEL_DB[:items]
+    @c.set_validations{validates_unique(:username){|ds| ds.filter(:active)}}
+    @c.dataset.extend(Module.new {
+      def fetch_rows (sql)
+        @db << sql
+        yield({:v => 0})
+      end
+    })
+    
+    MODEL_DB.reset
+    @c.new(:username => "0records", :password => "anothertest").should be_valid
+    @c.load(:id=>3, :username => "0records", :password => "anothertest").should be_valid
+    MODEL_DB.sqls.should == ["SELECT COUNT(*) AS count FROM items WHERE ((username = '0records') AND active) LIMIT 1",
+                    "SELECT COUNT(*) AS count FROM items WHERE (((username = '0records') AND active) AND (id != 3)) LIMIT 1"]
   end
 end 

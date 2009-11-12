@@ -69,8 +69,9 @@ module Sequel
     def column_definition_sql(column)
       sql = "#{quote_identifier(column[:name])} #{type_literal(column)}"
       sql << UNIQUE if column[:unique]
-      sql << NOT_NULL if column[:null] == false
-      sql << NULL if column[:null] == true
+      null = column.include?(:null) ? column[:null] : column[:allow_null]
+      sql << NOT_NULL if null == false
+      sql << NULL if null == true
       sql << " DEFAULT #{literal(column[:default])}" if column.include?(:default)
       sql << PRIMARY_KEY if column[:primary_key]
       sql << " #{auto_increment_sql}" if column[:auto_increment]
@@ -158,7 +159,7 @@ module Sequel
       elsif index[:where]
         raise Error, "Partial indexes are not supported for this database"
       else
-        "CREATE #{'UNIQUE ' if index[:unique]}INDEX #{quote_identifier(index_name)} ON #{quote_identifier(table_name)} #{literal(index[:columns])}"
+        "CREATE #{'UNIQUE ' if index[:unique]}INDEX #{quote_identifier(index_name)} ON #{quote_schema_table(table_name)} #{literal(index[:columns])}"
       end
     end
   

@@ -1,5 +1,3 @@
-Sequel.require %w'date_format unsupported', 'adapters/utils'
-
 module Sequel
   module Progress
     module DatabaseMethods
@@ -17,15 +15,22 @@ module Sequel
     end
   
     module DatasetMethods
-      include Dataset::UnsupportedIntersectExcept
-      include Dataset::SQLStandardDateFormat
+      SELECT_CLAUSE_METHODS = Dataset.clause_methods(:select, %w'limit distinct columns from join where group order having compounds')
 
-      SELECT_CLAUSE_ORDER = %w'limit distinct columns from join where group order having compounds'.freeze
+      # Progress requires SQL standard datetimes
+      def requires_sql_standard_datetimes?
+        true
+      end
+
+      # Progress does not support INTERSECT or EXCEPT
+      def supports_intersect_except?
+        false
+      end
 
       private
 
-      def select_clause_order
-        SELECT_CLAUSE_ORDER
+      def select_clause_methods
+        SELECT_CLAUSE_METHODS
       end
 
       # Progress uses TOP for limit, but it is only supported in Progress 10.

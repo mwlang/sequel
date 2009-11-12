@@ -29,10 +29,8 @@ describe "Database schema parser" do
     INTEGRATION_DB.schema(:items, :reload=>true)
     clear_sqls
     INTEGRATION_DB.schema(:items)
-    sqls_should_be
     clear_sqls
     INTEGRATION_DB.schema(:items, :reload=>true)
-    sqls_should_be "PRAGMA table_info('items')"
   end
 
   specify "should raise an error when the table doesn't exist" do
@@ -53,10 +51,9 @@ describe "Database schema parser" do
     col_info[:type].should == :integer
     clear_sqls
     INTEGRATION_DB.schema(:items)
-    sqls_should_be
   end
 
-  specify "should parse primary keys from the schema properly" do
+  cspecify "should parse primary keys from the schema properly", [proc{|db| db.class.adapter_scheme != :jdbc}, :mssql] do
     INTEGRATION_DB.create_table!(:items){Integer :number}
     INTEGRATION_DB.schema(:items).collect{|k,v| k if v[:primary_key]}.compact.should == []
     INTEGRATION_DB.create_table!(:items){primary_key :number}
@@ -74,14 +71,14 @@ describe "Database schema parser" do
 
   specify "should parse defaults from the schema properly" do
     INTEGRATION_DB.create_table!(:items){Integer :number}
-    INTEGRATION_DB.schema(:items).first.last[:default].should == nil
+    INTEGRATION_DB.schema(:items).first.last[:ruby_default].should == nil
     INTEGRATION_DB.create_table!(:items){Integer :number, :default=>0}
-    INTEGRATION_DB.schema(:items).first.last[:default].to_s.should == "0"
+    INTEGRATION_DB.schema(:items).first.last[:ruby_default].should == 0
     INTEGRATION_DB.create_table!(:items){String :a, :default=>"blah"}
-    INTEGRATION_DB.schema(:items).first.last[:default].should include('blah')
+    INTEGRATION_DB.schema(:items).first.last[:ruby_default].should == 'blah'
   end
 
-  specify "should parse types from the schema properly" do
+  cspecify "should parse types from the schema properly", [:do, :mysql], [:jdbc, :mysql] do
     INTEGRATION_DB.create_table!(:items){Integer :number}
     INTEGRATION_DB.schema(:items).first.last[:type].should == :integer
     INTEGRATION_DB.create_table!(:items){Fixnum :number}
@@ -146,74 +143,176 @@ end
 
 describe "Database schema modifiers" do
   before do
-    @ds = INTEGRATION_DB[:items]
+    @db = INTEGRATION_DB
+    @ds = @db[:items]
     clear_sqls
   end
   after do
-    INTEGRATION_DB.drop_table(:items) if INTEGRATION_DB.table_exists?(:items)
+    @db.drop_table(:items) if @db.table_exists?(:items)
   end
 
   specify "should create tables correctly" do
-    INTEGRATION_DB.create_table!(:items){Integer :number}
-    INTEGRATION_DB.table_exists?(:items).should == true
-    INTEGRATION_DB.schema(:items, :reload=>true).map{|x| x.first}.should == [:number]
+    @db.create_table!(:items){Integer :number}
+    @db.table_exists?(:items).should == true
+    @db.schema(:items, :reload=>true).map{|x| x.first}.should == [:number]
+    @ds.insert([10])
+    @ds.columns!.should == [:number]
+  end
+  
+  specify "should allow creating indexes with tables" do
+    @db.create_table!(:items){Integer :number; index :number}
+    @db.table_exists?(:items).should == true
+    @db.schema(:items, :reload=>true).map{|x| x.first}.should == [:number]
     @ds.insert([10])
     @ds.columns!.should == [:number]
   end
 
   specify "should handle foreign keys correctly when creating tables" do
-    INTEGRATION_DB.create_table!(:items) do 
+    @db.create_table!(:items) do 
       primary_key :id
       foreign_key :item_id, :items
       unique [:item_id, :id]
       foreign_key [:id, :item_id], :items, :key=>[:item_id, :id]
     end
-    INTEGRATION_DB.table_exists?(:items).should == true
-    INTEGRATION_DB.schema(:items, :reload=>true).map{|x| x.first}.should == [:id, :item_id]
+    @db.table_exists?(:items).should == true
+    @db.schema(:items, :reload=>true).map{|x| x.first}.should == [:id, :item_id]
     @ds.columns!.should == [:id, :item_id]
   end
 
   specify "should add columns to tables correctly" do
-    INTEGRATION_DB.create_table!(:items){Integer :number}
-    INTEGRATION_DB.schema(:items, :reload=>true).map{|x| x.first}.should == [:number]
-    @ds.columns!.should == [:number]
-    INTEGRATION_DB.alter_table(:items){add_column :name, :text}
-    INTEGRATION_DB.schema(:items, :reload=>true).map{|x| x.first}.should == [:number, :name]
+    @db.create_table!(:items){Integer :number}
+    @ds.insert(:number=>10)
+    @db.alter_table(:items){add_column :name, :text}
+    @db.schema(:items, :reload=>true).map{|x| x.first}.should == [:number, :name]
     @ds.columns!.should == [:number, :name]
-    unless INTEGRATION_DB.database_type == :sqlite
-      INTEGRATION_DB.alter_table(:items){add_primary_key :id}
-      INTEGRATION_DB.schema(:items, :reload=>true).map{|x| x.first}.should == [:number, :name, :id]
-      @ds.columns!.should == [:number, :name, :id]
-      INTEGRATION_DB.alter_table(:items){add_foreign_key :item_id, :items}
-      INTEGRATION_DB.schema(:items, :reload=>true).map{|x| x.first}.should == [:number, :name, :id, :item_id]
-      @ds.columns!.should == [:number, :name, :id, :item_id]
-      INTEGRATION_DB.alter_table(:items) do
-        add_unique_constraint [:item_id, :id]
-        add_foreign_key [:id, :item_id], :items, :key=>[:item_id, :id]
-      end
-      INTEGRATION_DB.schema(:items, :reload=>true).map{|x| x.first}.should == [:number, :name, :id, :item_id]
-      @ds.columns!.should == [:number, :name, :id, :item_id]
-    end
+    @ds.all.should == [{:number=>10, :name=>nil}]
   end
 
-  specify "should remove columns from tables correctly" do
-    INTEGRATION_DB.create_table!(:items) do
+  cspecify "should add primary key columns to tables correctly", :h2 do
+    @db.create_table!(:items){Integer :number}
+    @ds.insert(:number=>10)
+    @db.alter_table(:items){add_primary_key :id}
+    @db.schema(:items, :reload=>true).map{|x| x.first}.should == [:number, :id]
+    @ds.columns!.should == [:number, :id]
+    @ds.map(:number).should == [10]
+  end
+
+  specify "should add foreign key columns to tables correctly" do
+    @db.create_table!(:items){primary_key :id}
+    i = @ds.insert
+    @db.alter_table(:items){add_foreign_key :item_id, :items}
+    @db.schema(:items, :reload=>true).map{|x| x.first}.should == [:id, :item_id]
+    @ds.columns!.should == [:id, :item_id]
+    @ds.all.should == [{:id=>i, :item_id=>nil}]
+  end
+
+  specify "should rename columns correctly" do
+    @db.create_table!(:items){Integer :id}
+    @ds.insert(:id=>10)
+    @db.alter_table(:items){rename_column :id, :id2}
+    @db.schema(:items, :reload=>true).map{|x| x.first}.should == [:id2]
+    @ds.columns!.should == [:id2]
+    @ds.all.should == [{:id2=>10}]
+  end
+
+  specify "should rename columns with defaults correctly" do
+    @db.create_table!(:items){String :n, :default=>'blah'}
+    @ds.insert
+    @db.alter_table(:items){rename_column :n, :n2}
+    @db.schema(:items, :reload=>true).map{|x| x.first}.should == [:n2]
+    @ds.columns!.should == [:n2]
+    @ds.insert
+    @ds.all.should == [{:n2=>'blah'}, {:n2=>'blah'}]
+  end
+
+  cspecify "should rename columns with not null constraints", [:mysql, :mysql] do
+    @db.create_table!(:items){String :n, :null=>false}
+    @ds.insert(:n=>'blah')
+    @db.alter_table(:items){rename_column :n, :n2}
+    @db.schema(:items, :reload=>true).map{|x| x.first}.should == [:n2]
+    @ds.columns!.should == [:n2]
+    @ds.insert(:n2=>'blah')
+    @ds.all.should == [{:n2=>'blah'}, {:n2=>'blah'}]
+    proc{@ds.insert}.should raise_error(Sequel::DatabaseError)
+  end
+
+  cspecify "should set column NULL/NOT NULL correctly", [:mysql, :mysql] do
+    @db.create_table!(:items){Integer :id}
+    @ds.insert(:id=>10)
+    @db.alter_table(:items){set_column_allow_null :id, false}
+    @db.schema(:items, :reload=>true).map{|x| x.first}.should == [:id]
+    @ds.columns!.should == [:id]
+    proc{@ds.insert}.should raise_error(Sequel::DatabaseError)
+    @db.alter_table(:items){set_column_allow_null :id, true}
+    @ds.insert
+    @ds.all.should == [{:id=>10}, {:id=>nil}]
+  end
+
+  specify "should set column defaults correctly" do
+    @db.create_table!(:items){Integer :id}
+    @ds.insert(:id=>10)
+    @db.alter_table(:items){set_column_default :id, 20}
+    @db.schema(:items, :reload=>true).map{|x| x.first}.should == [:id]
+    @ds.columns!.should == [:id]
+    @ds.insert
+    @ds.all.should == [{:id=>10}, {:id=>20}]
+  end
+
+  specify "should set column types correctly" do
+    @db.create_table!(:items){Integer :id}
+    @ds.insert(:id=>10)
+    @db.alter_table(:items){set_column_type :id, String}
+    @db.schema(:items, :reload=>true).map{|x| x.first}.should == [:id]
+    @ds.columns!.should == [:id]
+    @ds.insert(:id=>20)
+    @ds.all.should == [{:id=>"10"}, {:id=>"20"}]
+  end
+
+  cspecify "should add unique constraints and foreign key table constraints correctly", :sqlite do
+    @db.create_table!(:items){Integer :id; Integer :item_id}
+    @db.alter_table(:items) do
+      add_unique_constraint [:item_id, :id]
+      add_foreign_key [:id, :item_id], :items, :key=>[:item_id, :id]
+    end
+    @db.schema(:items, :reload=>true).map{|x| x.first}.should == [:id, :item_id]
+    @ds.columns!.should == [:id, :item_id]
+  end
+
+  cspecify "should remove columns from tables correctly", :h2, :mssql do
+    @db.create_table!(:items) do
       primary_key :id
       String :name
       Integer :number
       foreign_key :item_id, :items
     end
     @ds.insert(:number=>10)
-    INTEGRATION_DB.schema(:items, :reload=>true).map{|x| x.first}.should == [:id, :name, :number, :item_id]
+    @db.schema(:items, :reload=>true).map{|x| x.first}.should == [:id, :name, :number, :item_id]
     @ds.columns!.should == [:id, :name, :number, :item_id]
-    INTEGRATION_DB.drop_column(:items, :number)
-    INTEGRATION_DB.schema(:items, :reload=>true).map{|x| x.first}.should == [:id, :name, :item_id]
+    @db.drop_column(:items, :number)
+    @db.schema(:items, :reload=>true).map{|x| x.first}.should == [:id, :name, :item_id]
     @ds.columns!.should == [:id, :name, :item_id]
-    INTEGRATION_DB.drop_column(:items, :name)
-    INTEGRATION_DB.schema(:items, :reload=>true).map{|x| x.first}.should == [:id, :item_id]
+    @db.drop_column(:items, :name)
+    @db.schema(:items, :reload=>true).map{|x| x.first}.should == [:id, :item_id]
     @ds.columns!.should == [:id, :item_id]
-    INTEGRATION_DB.drop_column(:items, :item_id)
-    INTEGRATION_DB.schema(:items, :reload=>true).map{|x| x.first}.should == [:id]
+    @db.drop_column(:items, :item_id)
+    @db.schema(:items, :reload=>true).map{|x| x.first}.should == [:id]
+    @ds.columns!.should == [:id]
+  end
+
+  specify "should remove multiple columns in a single alter_table block" do
+    @db.create_table!(:items) do
+      primary_key :id
+      String :name
+      Integer :number
+    end
+    @ds.insert(:number=>10)
+    @db.schema(:items, :reload=>true).map{|x| x.first}.should == [:id, :name, :number]
+    @ds.columns!.should == [:id, :name, :number]
+    @db.alter_table(:items) do
+      drop_column :name
+      drop_column :number
+    end
+    @db.schema(:items, :reload=>true).map{|x| x.first}.should == [:id]
     @ds.columns!.should == [:id]
   end
 end

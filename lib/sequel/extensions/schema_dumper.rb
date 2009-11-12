@@ -6,10 +6,6 @@
 
 module Sequel
   class Database
-    POSTGRES_DEFAULT_RE = /\A(?:B?('.*')::[^']+|\((-?\d+(?:\.\d+)?)\))\z/
-    MYSQL_TIMESTAMP_RE = /\ACURRENT_(?:DATE|TIMESTAMP)?\z/
-    STRING_DEFAULT_RE = /\A'(.*)'\z/
-    
     # Dump indexes for all tables as a migration.  This complements
     # the :indexes=>false option to dump_schema_migration. Options:
     # * :same_db - Create a dump for the same database type, so
@@ -72,65 +68,12 @@ END_MIG
     end
 
     private
-    
-    # Convert the given default, which should be a database specific string, into
-    # a ruby object.
-    def column_schema_to_ruby_default(default, type, options)
-      return if default.nil?
-      orig_default = default
-      if database_type == :postgres and m = POSTGRES_DEFAULT_RE.match(default)
-        default = m[1] || m[2]
-      end
-      if [:string, :blob, :date, :datetime, :time].include?(type)
-        if database_type == :mysql
-          if [:date, :datetime, :time].include?(type) && MYSQL_TIMESTAMP_RE.match(default)
-            return column_schema_to_ruby_default_fallback(default, options)
-          end
-          orig_default = default = "'#{default.gsub("'", "''").gsub('\\', '\\\\')}'" 
-        end
-        if m = STRING_DEFAULT_RE.match(default)
-          default = m[1].gsub("''", "'")
-        else
-          return column_schema_to_ruby_default_fallback(default, options)
-        end
-      end
-      res = begin
-        case type
-        when :boolean
-          case default 
-          when /[f0]/i
-            false
-          when /[t1]/i
-            true
-          end
-        when :string
-          default
-        when :blob
-          Sequel::SQL::Blob.new(default)
-        when :integer
-          Integer(default)
-        when :float
-          Float(default)
-        when :date
-          Sequel.string_to_date(default)
-        when :datetime
-          DateTime.parse(default)
-        when :time
-          Sequel.string_to_time(default)
-        when :decimal
-          BigDecimal.new(default)
-        end
-      rescue
-        nil
-      end
-      res.nil? ? column_schema_to_ruby_default_fallback(orig_default, options) : res
-    end
         
-    # If the database default can't be converted, return the string with the inspect
+    # If a database default exists and can't be converted, return the string with the inspect
     # method modified so that .lit is always appended after it, only if the
     # :same_db option is used.
     def column_schema_to_ruby_default_fallback(default, options)
-      if options[:same_db]
+      if default.is_a?(String) && options[:same_db] && use_column_schema_to_ruby_default_fallback?
         default = default.to_s
         def default.inspect
           "#{super}.lit"
@@ -148,8 +91,12 @@ END_MIG
         col_opts = options[:same_db] ? {:type=>schema[:db_type]} : column_schema_to_ruby_type(schema)
         type = col_opts.delete(:type)
         col_opts.delete(:size) if col_opts[:size].nil?
-        default = column_schema_to_ruby_default(schema[:default], schema[:type], options) if schema[:default]
-        col_opts[:default] = default unless default.nil?
+        col_opts[:default] = if schema[:ruby_default].nil?
+          column_schema_to_ruby_default_fallback(schema[:default], options)
+        else
+          schema[:ruby_default]
+        end
+        col_opts.delete(:default) if col_opts[:default].nil?
         col_opts[:null] = false if schema[:allow_null] == false
         [:column, name, type, col_opts]
       end
@@ -162,30 +109,30 @@ END_MIG
       case t = schema[:db_type].downcase
       when /\A(?:medium|small)?int(?:eger)?(?:\((?:\d+)\))?\z/o
         {:type=>Integer}
-      when /\Atinyint(?:\((?:\d+)\))?\z/o
-        {:type=>(Sequel.convert_tinyint_to_bool ? TrueClass : Integer)}
+      when /\Atinyint(?:\((\d+)\))?\z/o
+        {:type=>(self.class.adapter_scheme == :mysql && $1 == '1' && Sequel::MySQL.convert_tinyint_to_bool ? TrueClass : Integer)}
       when /\Abigint(?:\((?:\d+)\))?\z/o
         {:type=>Bignum}
       when /\A(?:real|float|double(?: precision)?)\z/o
         {:type=>Float}
       when 'boolean'
         {:type=>TrueClass}
-      when /\A(?:(?:tiny|medium|long)?text|clob)\z/o
+      when /\A(?:(?:tiny|medium|long|n)?text|clob)\z/o
         {:type=>String, :text=>true}
       when 'date'
         {:type=>Date}
-      when 'datetime'
+      when /\A(?:small)?datetime\z/o
         {:type=>DateTime}
       when /\Atimestamp(?: with(?:out)? time zone)?\z/o
         {:type=>DateTime}
       when /\Atime(?: with(?:out)? time zone)?\z/o
         {:type=>Time, :only_time=>true}
-      when /\Achar(?:acter)?(?:\((\d+)\))?\z/o
+      when /\An?char(?:acter)?(?:\((\d+)\))?\z/o
         {:type=>String, :size=>($1.to_i if $1), :fixed=>true}
-      when /\A(?:varchar|character varying|bpchar|string)(?:\((\d+)\))?\z/o
+      when /\A(?:n?varchar|character varying|bpchar|string)(?:\((\d+)\))?\z/o
         s = ($1.to_i if $1)
         {:type=>String, :size=>(s == 255 ? nil : s)}
-      when 'money'
+      when /\A(?:small)?money\z/o
         {:type=>BigDecimal, :size=>[19,2]}
       when /\A(?:decimal|numeric|number)(?:\((\d+)(?:,\s*(\d+))?\))?\z/o
         s = [($1.to_i if $1), ($2.to_i if $2)].compact
@@ -217,6 +164,12 @@ END_MIG
       h[:name] = name unless default_index_name(table, index_opts[:columns]) == name.to_s
       h[:unique] = true if index_opts[:unique]
       h
+    end
+    
+    # Don't use the "...".lit fallback on MySQL, since the defaults it uses aren't
+    # valid literal SQL values.
+    def use_column_schema_to_ruby_default_fallback?
+      database_type != :mysql
     end
   end
 

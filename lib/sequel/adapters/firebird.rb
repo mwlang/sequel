@@ -1,5 +1,4 @@
 require 'fb'
-Sequel.require 'adapters/utils/unsupported'
 
 module Sequel
   # The Sequel Firebird adapter requires the ruby fb driver located at
@@ -199,14 +198,11 @@ module Sequel
 
     # Dataset class for Firebird datasets
     class Dataset < Sequel::Dataset
-      include UnsupportedIntersectExcept
-
       BOOL_TRUE = '1'.freeze
       BOOL_FALSE = '0'.freeze
       NULL = LiteralString.new('NULL').freeze
       COMMA_SEPARATOR = ', '.freeze
-      FIREBIRD_TIMESTAMP_FORMAT = "TIMESTAMP '%Y-%m-%d %H:%M:%S".freeze
-      SELECT_CLAUSE_ORDER = %w'distinct limit columns from join where group having compounds order'.freeze
+      SELECT_CLAUSE_METHODS = clause_methods(:select, %w'with distinct limit columns from join where group having compounds order')
 
       # Yield all rows returned by executing the given SQL and converting
       # the types.
@@ -251,15 +247,24 @@ module Sequel
       def insert_select(*values)
         naked.clone(default_server_opts(:sql=>insert_returning_sql(nil, *values))).single_record
       end
+      
+      def requires_sql_standard_datetimes?
+        true
+      end
 
       # The order of clauses in the SELECT SQL statement
-      def select_clause_order
-        SELECT_CLAUSE_ORDER
+      def select_clause_methods
+        SELECT_CLAUSE_METHODS
       end
       
       def select_limit_sql(sql)
         sql << " FIRST #{@opts[:limit]}" if @opts[:limit]
         sql << " SKIP #{@opts[:offset]}" if @opts[:offset]
+      end
+
+      # Firebird does not support INTERSECT or EXCEPT
+      def supports_intersect_except?
+        false
       end
 
       private
@@ -271,16 +276,8 @@ module Sequel
         end
       end
 
-      def literal_datetime(v)
-        "#{v.strftime(FIREBIRD_TIMESTAMP_FORMAT)}.#{sprintf("%04d",(v.sec_fraction * 864000000))}'"
-      end
-
       def literal_false
         BOOL_FALSE
-      end
-
-      def literal_time(v)
-        "#{v.strftime(FIREBIRD_TIMESTAMP_FORMAT)}.#{sprintf("%04d",v.usec / 100)}'"
       end
 
       def literal_true

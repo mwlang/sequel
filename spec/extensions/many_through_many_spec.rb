@@ -23,6 +23,19 @@ describe Sequel::Model, "many_through_many" do
     Object.send(:remove_const, :Tag)
   end
 
+  it "should default to associating to other models in the same scope" do
+    class ::AssociationModuleTest
+      class Artist < Sequel::Model
+        plugin :many_through_many
+        many_through_many :tags, [[:albums_artists, :artist_id, :album_id], [:albums, :id, :id], [:albums_tags, :album_id, :tag_id]]
+      end  
+      class Tag < Sequel::Model
+      end  
+    end  
+    
+    ::AssociationModuleTest::Artist.association_reflection(:tags).associated_class.should == ::AssociationModuleTest::Tag
+  end 
+
   it "should raise an error if in invalid form of through is used" do
     proc{@c1.many_through_many :tags, [[:albums_artists, :artist_id, :album_id], [:albums, :id, :id], [:albums_tags, :album_id]]}.should raise_error(Sequel::Error)
     proc{@c1.many_through_many :tags, [[:albums_artists, :artist_id, :album_id], [:albums, :id, :id], {:table=>:album_tags, :left=>:album_id}]}.should raise_error(Sequel::Error)
@@ -66,6 +79,16 @@ describe Sequel::Model, "many_through_many" do
     a = n.tags_dataset
     a.should be_a_kind_of(Sequel::Dataset)
     a.sql.should == 'SELECT tags.* FROM tags INNER JOIN albums_tags ON (albums_tags.tag_id = tags.tag_id) INNER JOIN albums ON (albums.id = albums_tags.album_id) INNER JOIN albums_artists ON ((albums_artists.album_id = albums.id) AND (albums_artists.artist_id = 85))'
+    n.tags.should == [@c2.load(:id=>1)]
+  end
+  
+  it "should handle composite keys" do
+    @c1.many_through_many :tags, [[:albums_artists, [:b1, :b2], [:c1, :c2]], [:albums, [:d1, :d2], [:e1, :e2]], [:albums_tags, [:f1, :f2], [:g1, :g2]]], :right_primary_key=>[:h1, :h2], :left_primary_key=>[:id, :yyy]
+    n = @c1.load(:id => 1234)
+    n.yyy = 85
+    a = n.tags_dataset
+    a.should be_a_kind_of(Sequel::Dataset)
+    a.sql.should == 'SELECT tags.* FROM tags INNER JOIN albums_tags ON ((albums_tags.g1 = tags.h1) AND (albums_tags.g2 = tags.h2)) INNER JOIN albums ON ((albums.e1 = albums_tags.f1) AND (albums.e2 = albums_tags.f2)) INNER JOIN albums_artists ON ((albums_artists.c1 = albums.d1) AND (albums_artists.c2 = albums.d2) AND (albums_artists.b1 = 1234) AND (albums_artists.b2 = 85))'
     n.tags.should == [@c2.load(:id=>1)]
   end
   
@@ -274,8 +297,18 @@ describe 'Sequel::Plugins::ManyThroughMany::ManyThroughManyAssociationReflection
     @ar.edges.should == [{:conditions=>[], :left=>:id, :right=>:artist_id, :table=>:albums_artists, :join_type=>:left_outer, :block=>nil}, {:conditions=>[], :left=>:album_id, :right=>:id, :table=>:albums, :join_type=>:left_outer, :block=>nil}, {:conditions=>[], :left=>:id, :right=>:album_id, :table=>:albums_tags, :join_type=>:left_outer, :block=>nil}]
   end
   
+  it "#edges should handle composite keys" do
+    Artist.many_through_many :tags, [[:albums_artists, [:b1, :b2], [:c1, :c2]], [:albums, [:d1, :d2], [:e1, :e2]], [:albums_tags, [:f1, :f2], [:g1, :g2]]], :right_primary_key=>[:h1, :h2], :left_primary_key=>[:id, :yyy]
+    Artist.association_reflection(:tags).edges.should == [{:conditions=>[], :left=>[:id, :yyy], :right=>[:b1, :b2], :table=>:albums_artists, :join_type=>:left_outer, :block=>nil}, {:conditions=>[], :left=>[:c1, :c2], :right=>[:d1, :d2], :table=>:albums, :join_type=>:left_outer, :block=>nil}, {:conditions=>[], :left=>[:e1, :e2], :right=>[:f1, :f2], :table=>:albums_tags, :join_type=>:left_outer, :block=>nil}]
+  end
+  
   it "#reverse_edges should be an array of joins to make when lazy loading or eager loading" do
     @ar.reverse_edges.should == [{:alias=>:albums_tags, :left=>:tag_id, :right=>:id, :table=>:albums_tags}, {:alias=>:albums, :left=>:id, :right=>:album_id, :table=>:albums}]
+  end
+  
+  it "#reverse_edges should handle composite keys" do
+    Artist.many_through_many :tags, [[:albums_artists, [:b1, :b2], [:c1, :c2]], [:albums, [:d1, :d2], [:e1, :e2]], [:albums_tags, [:f1, :f2], [:g1, :g2]]], :right_primary_key=>[:h1, :h2], :left_primary_key=>[:id, :yyy]
+    Artist.association_reflection(:tags).reverse_edges.should == [{:alias=>:albums_tags, :left=>[:g1, :g2], :right=>[:h1, :h2], :table=>:albums_tags}, {:alias=>:albums, :left=>[:e1, :e2], :right=>[:f1, :f2], :table=>:albums}]
   end
   
   it "#reciprocal should be nil" do
@@ -326,6 +359,8 @@ describe "Sequel::Plugins::ManyThroughMany eager loading methods" do
         h = {:id => 2}
         if sql =~ /albums_artists.artist_id IN \(([18])\)/
           h.merge!(:x_foreign_key_x=>$1.to_i)
+        elsif sql =~ /\(\(albums_artists.b1, albums_artists.b2\) IN \(\(1, 8\)\)\)/
+          h.merge!(:x_foreign_key_0_x=>1, :x_foreign_key_1_x=>8)
         end
         h[:tag_id] = h.delete(:id) if sql =~ /albums_artists.artist_id IN \(8\)/
         yield h
@@ -440,7 +475,7 @@ describe "Sequel::Plugins::ManyThroughMany eager loading methods" do
     a = @c1.eager(:tags).all
     a.should == [@c1.load(:id=>1)]
     MODEL_DB.sqls.should == ['SELECT * FROM artists',
-      'SELECT tags.id, tracks.id AS tracks_id, albums_artists.artist_id AS x_foreign_key_x FROM tags INNER JOIN albums_tags ON (albums_tags.tag_id = tags.id) INNER JOIN albums ON (albums.id = albums_tags.album_id) INNER JOIN albums_artists ON ((albums_artists.album_id = albums.id) AND (albums_artists.artist_id IN (1))) LEFT OUTER JOIN albums_tags AS albums_tags_0 ON (albums_tags_0.tag_id = tags.id) LEFT OUTER JOIN albums AS albums_0 ON (albums_0.id = albums_tags_0.album_id) LEFT OUTER JOIN tracks ON (tracks.album_id = albums_0.id)']
+      'SELECT tags.id, tracks.id AS tracks_id, albums_artists.artist_id AS x_foreign_key_x FROM (SELECT tags.* FROM tags INNER JOIN albums_tags ON (albums_tags.tag_id = tags.id) INNER JOIN albums ON (albums.id = albums_tags.album_id) INNER JOIN albums_artists ON ((albums_artists.album_id = albums.id) AND (albums_artists.artist_id IN (1)))) AS tags LEFT OUTER JOIN albums_tags AS albums_tags_0 ON (albums_tags_0.tag_id = tags.id) LEFT OUTER JOIN albums ON (albums.id = albums_tags_0.album_id) LEFT OUTER JOIN tracks ON (tracks.album_id = albums.id)']
     a = a.first
     a.tags.should == [Tag.load(:id=>2)]
     a.tags.first.tracks.should == [Track.load(:id=>4)]
@@ -460,7 +495,7 @@ describe "Sequel::Plugins::ManyThroughMany eager loading methods" do
     @c1.many_through_many :tags, [[:albums_artists, :artist_id, :album_id], [:albums, :id, :id], [:albums_tags, :album_id, :tag_id]], :eager_graph=>:tracks
     a = @c1.load(:id=>1)
     a.tags
-    MODEL_DB.sqls.should == [ 'SELECT tags.id, tracks.id AS tracks_id FROM tags INNER JOIN albums_tags ON (albums_tags.tag_id = tags.id) INNER JOIN albums ON (albums.id = albums_tags.album_id) INNER JOIN albums_artists ON ((albums_artists.album_id = albums.id) AND (albums_artists.artist_id = 1)) LEFT OUTER JOIN albums_tags AS albums_tags_0 ON (albums_tags_0.tag_id = tags.id) LEFT OUTER JOIN albums AS albums_0 ON (albums_0.id = albums_tags_0.album_id) LEFT OUTER JOIN tracks ON (tracks.album_id = albums_0.id)']
+    MODEL_DB.sqls.should == [ 'SELECT tags.id, tracks.id AS tracks_id FROM (SELECT tags.* FROM tags INNER JOIN albums_tags ON (albums_tags.tag_id = tags.id) INNER JOIN albums ON (albums.id = albums_tags.album_id) INNER JOIN albums_artists ON ((albums_artists.album_id = albums.id) AND (albums_artists.artist_id = 1))) AS tags LEFT OUTER JOIN albums_tags AS albums_tags_0 ON (albums_tags_0.tag_id = tags.id) LEFT OUTER JOIN albums ON (albums.id = albums_tags_0.album_id) LEFT OUTER JOIN tracks ON (tracks.album_id = albums.id)']
     a.tags.should == [Tag.load(:id=>2)]
     a.tags.first.tracks.should == [Track.load(:id=>4)]
     MODEL_DB.sqls.length.should == 1
@@ -539,6 +574,26 @@ describe "Sequel::Plugins::ManyThroughMany eager loading methods" do
     MODEL_DB.sqls.should == ['SELECT * FROM artists',
       'SELECT tags.*, albums_artists.artist_id AS x_foreign_key_x FROM tags INNER JOIN albums_tags ON (albums_tags.tag_id = tags.tag_id) INNER JOIN albums ON (albums.id = albums_tags.album_id) INNER JOIN albums_artists ON ((albums_artists.album_id = albums.id) AND (albums_artists.artist_id IN (8)))']
     a.first.tags.should == [Tag.load(:tag_id=>2)]
+    MODEL_DB.sqls.length.should == 2
+  end
+  
+  it "should handle composite keys" do
+    @c1.send(:define_method, :yyy){values[:yyy]}
+    @c1.dataset.extend(Module.new {
+      def columns
+        [:id, :yyy]
+      end
+      def fetch_rows(sql)
+        @db << sql
+        yield({:id=>1, :yyy=>8})
+      end
+    })
+    @c1.many_through_many :tags, [[:albums_artists, [:b1, :b2], [:c1, :c2]], [:albums, [:d1, :d2], [:e1, :e2]], [:albums_tags, [:f1, :f2], [:g1, :g2]]], :right_primary_key=>[:h1, :h2], :left_primary_key=>[:id, :yyy]
+    a = @c1.eager(:tags).all
+    a.should == [@c1.load(:id=>1, :yyy=>8)]
+    MODEL_DB.sqls.should == ['SELECT * FROM artists',
+      'SELECT tags.*, albums_artists.b1 AS x_foreign_key_0_x, albums_artists.b2 AS x_foreign_key_1_x FROM tags INNER JOIN albums_tags ON ((albums_tags.g1 = tags.h1) AND (albums_tags.g2 = tags.h2)) INNER JOIN albums ON ((albums.e1 = albums_tags.f1) AND (albums.e2 = albums_tags.f2)) INNER JOIN albums_artists ON ((albums_artists.c1 = albums.d1) AND (albums_artists.c2 = albums.d2) AND ((albums_artists.b1, albums_artists.b2) IN ((1, 8))))']
+    a.first.tags.should == [Tag.load(:id=>2)]
     MODEL_DB.sqls.length.should == 2
   end
 
@@ -709,6 +764,22 @@ describe "Sequel::Plugins::ManyThroughMany eager loading methods" do
     a = ds.all
     a.should == [@c1.load(:id=>1, :yyy=>8)]
     MODEL_DB.sqls.should == ['SELECT artists.id, artists.yyy, tags.id AS tags_id, tags.tag_id FROM artists LEFT OUTER JOIN albums_artists ON (albums_artists.artist_id = artists.yyy) LEFT OUTER JOIN albums ON (albums.id = albums_artists.album_id) LEFT OUTER JOIN albums_tags ON (albums_tags.album_id = albums.id) LEFT OUTER JOIN tags ON (tags.tag_id = albums_tags.tag_id)']
+    a.first.tags.should == [Tag.load(:id=>2, :tag_id=>4)]
+    MODEL_DB.sqls.length.should == 1
+  end
+  
+  it "eager graphing should respect composite keys" do 
+    @c1.many_through_many :tags, [[:albums_artists, [:b1, :b2], [:c1, :c2]], [:albums, [:d1, :d2], [:e1, :e2]], [:albums_tags, [:f1, :f2], [:g1, :g2]]], :right_primary_key=>[:id, :tag_id], :left_primary_key=>[:id, :yyy]
+    @c1.dataset.meta_def(:columns){[:id, :yyy]}
+    Tag.dataset.meta_def(:columns){[:id, :tag_id]}
+    ds = @c1.eager_graph(:tags)
+    def ds.fetch_rows(sql)
+      @db << sql
+      yield({:id=>1, :yyy=>8, :tags_id=>2, :tag_id=>4})
+    end
+    a = ds.all
+    a.should == [@c1.load(:id=>1, :yyy=>8)]
+    MODEL_DB.sqls.should == ['SELECT artists.id, artists.yyy, tags.id AS tags_id, tags.tag_id FROM artists LEFT OUTER JOIN albums_artists ON ((albums_artists.b1 = artists.id) AND (albums_artists.b2 = artists.yyy)) LEFT OUTER JOIN albums ON ((albums.d1 = albums_artists.c1) AND (albums.d2 = albums_artists.c2)) LEFT OUTER JOIN albums_tags ON ((albums_tags.f1 = albums.e1) AND (albums_tags.f2 = albums.e2)) LEFT OUTER JOIN tags ON ((tags.id = albums_tags.g1) AND (tags.tag_id = albums_tags.g2))']
     a.first.tags.should == [Tag.load(:id=>2, :tag_id=>4)]
     MODEL_DB.sqls.length.should == 1
   end

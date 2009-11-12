@@ -1,6 +1,7 @@
-Sequel.require %w'unsupported savepoint_transactions', 'adapters/utils'
-
 module Sequel
+  Dataset::NON_SQL_OPTIONS << :insert_ignore
+  Dataset::NON_SQL_OPTIONS << :on_duplicate_key_update
+
   module MySQL
     class << self
       # Set the default options used for CREATE TABLE
@@ -10,8 +11,6 @@ module Sequel
     # Methods shared by Database instances that connect to MySQL,
     # currently supported by the native and JDBC adapters.
     module DatabaseMethods
-      include Sequel::Database::SavepointTransactions
-    
       AUTO_INCREMENT = 'AUTO_INCREMENT'.freeze
       CAST_TYPES = {String=>:CHAR, Integer=>:SIGNED, Time=>:DATETIME, DateTime=>:DATETIME, Numeric=>:DECIMAL, BigDecimal=>:DECIMAL, File=>:BINARY}
       PRIMARY = 'PRIMARY'.freeze
@@ -64,6 +63,11 @@ module Sequel
         metadata_dataset.with_sql('SHOW TABLES').server(opts[:server]).map{|r| m.call(r.values.first)}
       end
       
+      # MySQL supports savepoints
+      def supports_savepoints?
+        true
+      end
+
       # Changes the database in use by issuing a USE statement.  I would be
       # very careful if I used this.
       def use(db_name)
@@ -90,12 +94,13 @@ module Sequel
         when :rename_column, :set_column_type, :set_column_null, :set_column_default
           o = op[:op]
           opts = schema(table).find{|x| x.first == op[:name]}
-          old_opts = opts ? opts.last : {}
-          name = o == :rename_column ? op[:new_name] : op[:name]
-          type = o == :set_column_type ? op[:type] : old_opts[:db_type]
-          null = o == :set_column_null ? op[:null] : old_opts[:allow_null]
-          default = o == :set_column_default ? op[:default] : (old_opts[:default].lit if old_opts[:default])
-          "ALTER TABLE #{quote_schema_table(table)} CHANGE COLUMN #{quote_identifier(op[:name])} #{column_definition_sql(op.merge(:name=>name, :type=>type, :null=>null, :default=>default))}"
+          opts = opts ? opts.last.dup : {}
+          opts[:name] = o == :rename_column ? op[:new_name] : op[:name]
+          opts[:type] = o == :set_column_type ? op[:type] : opts[:db_type]
+          opts[:null] = o == :set_column_null ? op[:null] : opts[:allow_null]
+          opts[:default] = o == :set_column_default ? op[:default] : opts[:ruby_default]
+          opts.delete(:default) if opts[:default] == nil
+          "ALTER TABLE #{quote_schema_table(table)} CHANGE COLUMN #{quote_identifier(op[:name])} #{column_definition_sql(op.merge(opts))}"
         when :drop_index
           "#{drop_index_sql(table, op)} ON #{quote_schema_table(table)}"
         else
@@ -186,21 +191,21 @@ module Sequel
         column[:only_time] ? :time : :datetime
       end
 
-      # MySQL doesn't have a true boolean class, so it uses tinyint
-      # MySQL doesn't have a true boolean class, so it uses tinyint
+      # MySQL doesn't have a true boolean class, so it uses tinyint(1)
       def type_literal_generic_trueclass(column)
-        :tinyint
+        :'tinyint(1)'
       end
     end
   
     # Dataset methods shared by datasets that use MySQL databases.
     module DatasetMethods
-      include Dataset::UnsupportedIntersectExcept
-
       BOOL_TRUE = '1'.freeze
       BOOL_FALSE = '0'.freeze
-      TIMESTAMP_FORMAT = "'%Y-%m-%d %H:%M:%S'".freeze
       COMMA_SEPARATOR = ', '.freeze
+      DELETE_CLAUSE_METHODS = Dataset.clause_methods(:delete, %w'from where order limit')
+      INSERT_CLAUSE_METHODS = Dataset.clause_methods(:insert, %w'ignore into columns values on_duplicate_key_update')
+      SELECT_CLAUSE_METHODS = Dataset.clause_methods(:select, %w'distinct columns from join where group having compounds order limit')
+      UPDATE_CLAUSE_METHODS = Dataset.clause_methods(:update, %w'table set where order limit')
       
       # MySQL specific syntax for LIKE/REGEXP searches, as well as
       # string concatenation.
@@ -217,20 +222,6 @@ module Sequel
         else
           super(op, args)
         end
-      end
-      
-      # MySQL supports ORDER and LIMIT clauses in DELETE statements.
-      def delete_sql
-        sql = super
-        sql << " ORDER BY #{expression_list(opts[:order])}" if opts[:order]
-        sql << " LIMIT #{opts[:limit]}" if opts[:limit]
-        sql
-      end
-
-      # MySQL doesn't support DISTINCT ON
-      def distinct(*columns)
-        raise(Error, "DISTINCT ON not supported by MySQL") unless columns.empty?
-        super
       end
 
       # Adds full text filter
@@ -312,8 +303,7 @@ module Sequel
 
       # MySQL specific syntax for inserting multiple values at once.
       def multi_insert_sql(columns, values)
-        values = values.map {|r| literal(Array(r))}.join(COMMA_SEPARATOR)
-        ["#{insert_sql_base}#{source_list(@opts[:from])} (#{identifier_list(columns)}) VALUES #{values}#{insert_sql_suffix}"]
+        [insert_sql(columns, LiteralString.new('VALUES ' + values.map {|r| literal(Array(r))}.join(COMMA_SEPARATOR)))]
       end
       
       # MySQL uses the nonstandard ` (backtick) for quoting identifiers.
@@ -324,77 +314,86 @@ module Sequel
       # MySQL specific syntax for REPLACE (aka UPSERT, or update if exists,
       # insert if it doesn't).
       def replace_sql(*values)
-        from = source_list(@opts[:from])
-        if values.empty?
-          "REPLACE INTO #{from} DEFAULT VALUES"
-        else
-          values = values[0] if values.size == 1
-          
-          case values
-          when Array
-            if values.empty?
-              "REPLACE INTO #{from} DEFAULT VALUES"
-            else
-              "REPLACE INTO #{from} VALUES #{literal(values)}"
-            end
-          when Hash
-            if values.empty?
-              "REPLACE INTO #{from} DEFAULT VALUES"
-            else
-              fl, vl = [], []
-              values.each {|k, v| fl << literal(k.is_a?(String) ? k.to_sym : k); vl << literal(v)}
-              "REPLACE INTO #{from} (#{fl.join(COMMA_SEPARATOR)}) VALUES (#{vl.join(COMMA_SEPARATOR)})"
-            end
-          when Dataset
-            "REPLACE INTO #{from} #{literal(values)}"
-          else
-            if values.respond_to?(:values)
-              replace_sql(values.values)
-            else  
-              "REPLACE INTO #{from} VALUES (#{literal(values)})"
-            end
-          end
-        end
+        clone(:replace=>true).insert_sql(*values)
       end
       
-      # MySQL supports ORDER and LIMIT clauses in UPDATE statements.
-      def update_sql(values)
-        sql = super
-        sql << " ORDER BY #{expression_list(opts[:order])}" if opts[:order]
-        sql << " LIMIT #{opts[:limit]}" if opts[:limit]
-        sql
+      #  does not support DISTINCT ON
+      def supports_distinct_on?
+        false
+      end
+
+      # MySQL does not support INTERSECT or EXCEPT
+      def supports_intersect_except?
+        false
+      end
+      
+      # MySQL does support fractional timestamps in literal timestamps, but it
+      # ignores them.  Also, using them seems to cause problems on 1.9.  Since
+      # they are ignored anyway, not using them is probably best.
+      def supports_timestamp_usecs?
+        false
+      end
+      
+      protected
+      
+      # If this is an replace instead of an insert, use replace instead
+      def _insert_sql
+        @opts[:replace] ? clause_sql(:replace) : super
       end
 
       private
 
+      # MySQL supports the ORDER BY and LIMIT clauses for DELETE statements
+      def delete_clause_methods
+        DELETE_CLAUSE_METHODS
+      end
+
+      # MySQL supports the IGNORE and ON DUPLICATE KEY UPDATE clauses for INSERT statements
+      def insert_clause_methods
+        INSERT_CLAUSE_METHODS
+      end
+      alias replace_clause_methods insert_clause_methods
+
+      # MySQL doesn't use the SQL standard DEFAULT VALUES.
+      def insert_columns_sql(sql)
+        values = opts[:values]
+        if values.is_a?(Array) && values.empty?
+          sql << " ()"
+        else
+          super
+        end
+      end
+
       # MySQL supports INSERT IGNORE INTO
-      def insert_sql_base
-        "INSERT #{'IGNORE ' if opts[:insert_ignore]}INTO "
+      def insert_ignore_sql(sql)
+        sql << " IGNORE" if opts[:insert_ignore]
       end
 
       # MySQL supports INSERT ... ON DUPLICATE KEY UPDATE
-      def insert_sql_suffix
-        on_duplicate_key_update_sql if opts[:on_duplicate_key_update]
+      def insert_on_duplicate_key_update_sql(sql)
+        sql << on_duplicate_key_update_sql if opts[:on_duplicate_key_update]
       end
 
-      # MySQL doesn't use the SQL standard DEFAULT VALUES.
-      def insert_default_values_sql
-        "#{insert_sql_base}#{source_list(@opts[:from])} () VALUES ()"
+      # MySQL doesn't use the standard DEFAULT VALUES for empty values.
+      def insert_values_sql(sql)
+        values = opts[:values]
+        if values.is_a?(Array) && values.empty?
+          sql << " VALUES ()"
+        else
+          super
+        end
       end
 
-      # Use MySQL Timestamp format
-      def literal_datetime(v)
-        v.strftime(TIMESTAMP_FORMAT)
+      # MySQL allows a LIMIT in DELETE and UPDATE statements.
+      def limit_sql(sql)
+        sql << " LIMIT #{@opts[:limit]}" if @opts[:limit]
       end
+      alias delete_limit_sql limit_sql
+      alias update_limit_sql limit_sql
 
       # Use 0 for false on MySQL
       def literal_false
         BOOL_FALSE
-      end
-
-      # Use MySQL Timestamp format
-      def literal_time(v)
-        v.strftime(TIMESTAMP_FORMAT)
       end
 
       # Use 1 for true on MySQL
@@ -419,6 +418,16 @@ module Sequel
 
           " ON DUPLICATE KEY UPDATE #{updating.join(COMMA_SEPARATOR)}"
         end
+      end
+
+      # MySQL does not support the SQL WITH clause for SELECT statements
+      def select_clause_methods
+        SELECT_CLAUSE_METHODS
+      end
+
+      # MySQL supports the ORDER BY and LIMIT clauses for UPDATE statements
+      def update_clause_methods
+        UPDATE_CLAUSE_METHODS
       end
     end
   end

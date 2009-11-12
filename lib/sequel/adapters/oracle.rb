@@ -67,11 +67,7 @@ module Sequel
             yield(r) if block_given?
             r
           rescue OCIException => e
-            if CONNECTION_ERROR_CODES.include?(e.code)  
-              raise(Sequel::DatabaseDisconnectError)              
-            else
-              raise
-            end
+            raise_error(e, :disconnect=>CONNECTION_ERROR_CODES.include?(e.code))
           end
         end
       end
@@ -95,7 +91,7 @@ module Sequel
       end
       
       def remove_transaction(conn)
-        conn.autocommit = true
+        conn.autocommit = true if conn
         super
       end
       
@@ -129,7 +125,7 @@ module Sequel
       def literal_other(v)
         case v
         when OraDate
-          literal_time(Time.local(*v.to_a))
+          literal(Sequel.database_to_application_timestamp(v))
         else
           super
         end

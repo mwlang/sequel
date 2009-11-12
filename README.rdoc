@@ -75,13 +75,13 @@ Sequel is designed to take the hassle away from connecting to databases and mani
 
 Sequel uses the concept of datasets to retrieve data. A Dataset object encapsulates an SQL query and supports chainability, letting you fetch data using a convenient Ruby DSL that is both concise and flexible.
 
-For example, the following one-liner returns the average GDP for the five biggest countries in the middle east region:
+For example, the following one-liner returns the average GDP for countries in the middle east region:
 
-  DB[:countries].filter(:region => 'Middle East').reverse_order(:area).limit(5).avg(:GDP)
+  DB[:countries].filter(:region => 'Middle East').avg(:GDP)
   
 Which is equivalent to:
 
-  SELECT avg(GDP) FROM countries WHERE region = 'Middle East' ORDER BY area DESC LIMIT 5
+  SELECT avg(GDP) FROM countries WHERE region = 'Middle East'
 
 Since datasets retrieve records only when needed, they can be stored and later reused. Records are fetched as hashes (or custom model objects), and are accessed using an Enumerable interface:
 
@@ -120,8 +120,10 @@ You can specify a block to connect, which will disconnect from the database afte
 
 === Arbitrary SQL queries
 
-  DB << "create table t (a text, b text)"
-  DB << "insert into t values ('a', 'b')"
+You can execute arbitrary SQL code using Database#run:
+
+  DB.run("create table t (a text, b text)")
+  DB.run("insert into t values ('a', 'b')")
 
 You can also create datasets based on raw SQL:
 
@@ -137,6 +139,7 @@ You can also fetch records with raw SQL through the dataset:
 
 You can use placeholders in your SQL string as well:
 
+  name = 'Jim'
   DB['select * from items where name = ?', name].each do |row|
     p row
   end
@@ -327,7 +330,7 @@ Which is equivalent to the SQL:
 When retrieving records from joined datasets, you get the results in a single hash, which is subject to clobbering if you have columns with the same name in multiple tables:
 
   DB[:items].join(:order_items, :item_id => :id).first
-  => {:id=>order_items.id), :item_id=>order_items.item_id}
+  => {:id=>order_items.id, :item_id=>order_items.item_id}
 
 Using graph, you can split the result hashes into subhashes, one per join:
 
@@ -407,7 +410,7 @@ Sequel models allow you to use any column as a primary key, and even composite k
   post = Post['ruby', 'hello world']
   post.pk #=> ['ruby', 'hello world']
 
-You can also define a model class that does not have a primary key, but then you lose the ability to update records.
+You can also define a model class that does not have a primary key, but then you lose the ability to easily update records.
 
 A model instance can also be fetched by specifying a condition:
 
@@ -439,9 +442,14 @@ You can read the record values as object attributes (assuming the attribute name
 You can also change record values:
 
   post.title = 'hey there'
+  # or 
+  post.set(:title=>'hey there')
+
+That will just change the value for the object, it will not persist the changes to the database.  To persist the record, call the #save method:
+
   post.save
 
-Another way to change values by using the #update method:
+If you want to modify record values and save the object after doing so, use the #update method:
 
   post.update(:title => 'hey there')
 
@@ -451,7 +459,7 @@ New records can be created by calling Model.create:
 
   post = Post.create(:title => 'hello world')
 
-Another way is to construct a new instance and save it:
+Another way is to construct a new instance and save it later:
 
   post = Post.new
   post.title = 'hello world'
@@ -459,12 +467,11 @@ Another way is to construct a new instance and save it:
 
 You can also supply a block to Model.new and Model.create:
 
-  post = Post.create{|p| p.title = 'hello world'}
-
   post = Post.new do |p|
     p.title = 'hello world'
-    p.save
   end
+
+  post = Post.create{|p| p.title = 'hello world'}
 
 === Hooks
 
@@ -472,13 +479,17 @@ You can execute custom code when creating, updating, or deleting records by defi
 
   class Post < Sequel::Model
     def after_create
+      super
       author.increase_post_count
     end
 
     def after_destroy
+      super
       author.decrease_post_count
     end
   end
+
+Note the use of super if you define your own hook methods.  Almost all Sequel::Model class and instance methods (not just hook methods) can be overridden safely, but you have to make sure to call super when doing so, otherwise you risk breaking things.
 
 For the example above, you should probably use a database trigger if you can.  Hooks can be used for data integrity, but they will only enforce that integrity when you are using the model.  If you plan on allowing any other access to the database, it's best to use database triggers for data integrity.
 
@@ -518,7 +529,7 @@ many_to_one creates a getter and setter for each model object:
   post.author = Author[:name => 'Sharon']
   post.author
 
-one_to_many and many_to_many create a getter method, a method for adding an object to the association, a method for removing an object from the association, and a method for removing all associated objected from the association:
+one_to_many and many_to_many create a getter method, a method for adding an object to the association, a method for removing an object from the association, and a method for removing all associated objects from the association:
 
   class Post < Sequel::Model
     one_to_many :comments
@@ -539,10 +550,10 @@ one_to_many and many_to_many create a getter method, a method for adding an obje
 All associations add a dataset method that can be used to further filter or reorder the returned objects, or modify all of them:
 
   # Delete all of this post's comments from the database
-  Post.comments_dataset.destroy
+  post.comments_dataset.destroy
 
   # Return all tags related to this post with no subscribers, ordered by the tag's name
-  Post.tags_dataset.filter(:subscribers=>0).order(:name).all
+  post.tags_dataset.filter(:subscribers=>0).order(:name).all
 
 === Eager Loading
 
@@ -636,7 +647,7 @@ Sequel models also provide a short hand notation for filters:
 
 === Model Validations
 
-You can define a validate method for your model, which save
+You can define a validate method for your model, which #save
 will check before attempting to save the model in the database.
 If an attribute of the model isn't valid, you should add a error
 message for that attribute to the model object's errors. If an
@@ -645,8 +656,8 @@ raise an error or return false depending on how it is configured.
 
   class Post < Sequel::Model
     def validate
-      errors[:name] << "can't be empty" if name.empty?
-      errors[:written_on] << "should be in the past" if written_on >= Time.now
+      errors.add(:name, "can't be empty") if name.empty?
+      errors.add(:written_on, "should be in the past") if written_on >= Time.now
     end
   end
 

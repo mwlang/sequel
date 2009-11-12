@@ -1,4 +1,5 @@
 require 'mysql'
+raise(LoadError, "require 'mysql' did not define Mysql::CLIENT_MULTI_RESULTS!\n  You are probably using the pure ruby mysql.rb driver,\n  which Sequel does not support. You need to install\n  the C based adapter, and make sure that the mysql.so\n  file is loaded instead of the mysql.rb file.\n") unless defined?(Mysql::CLIENT_MULTI_RESULTS)
 Sequel.require %w'shared/mysql utils/stored_procedures', 'adapters'
 
 module Sequel
@@ -7,31 +8,40 @@ module Sequel
   # A class level convert_invalid_date_time accessor exists if
   # the native adapter is used.  If set to nil or :nil, the adapter treats dates
   # like 0000-00-00 and times like 838:00:00 as nil values.  If set to :string,
-  # it returns the strings as is.  If is false by default, which means that
+  # it returns the strings as is.  It is false by default, which means that
   # invalid dates and times will raise errors.
+  #
+  #   Sequel::MySQL.convert_invalid_date_time = true
+  #
+  # Sequel converts the column type tinyint(1) to a boolean by default when
+  # using the native MySQL adapter.  You can turn off the conversion to use
+  # tinyint as an integer:
+  #
+  #   Sequel.convert_tinyint_to_bool = false
   module MySQL
     # Mapping of type numbers to conversion procs
     MYSQL_TYPES = {}
 
     # Use only a single proc for each type to save on memory
     MYSQL_TYPE_PROCS = {
-      [0, 246]  => lambda{|v| BigDecimal.new(v)},                       # decimal
-      [1]  => lambda{|v| Sequel.convert_tinyint_to_bool ? v.to_i != 0 : v.to_i}, # tinyint
-      [2, 3, 8, 9, 13, 247, 248]  => lambda{|v| v.to_i},                # integer
-      [4, 5]  => lambda{|v| v.to_f},                                    # float
-      [10, 14]  => lambda{|v| convert_date_time(:string_to_date, v)},   # date
-      [7, 12] => lambda{|v| convert_date_time(:string_to_datetime, v)}, # datetime
-      [11]  => lambda{|v| convert_date_time(:string_to_time, v)},       # time
-      [249, 250, 251, 252]  => lambda{|v| Sequel::SQL::Blob.new(v)}     # blob
+      [0, 246]  => lambda{|v| BigDecimal.new(v)},                         # decimal
+      [1]  => lambda{|v| convert_tinyint_to_bool ? v.to_i != 0 : v.to_i}, # tinyint
+      [2, 3, 8, 9, 13, 247, 248]  => lambda{|v| v.to_i},                  # integer
+      [4, 5]  => lambda{|v| v.to_f},                                      # float
+      [10, 14]  => lambda{|v| convert_date_time(:string_to_date, v)},     # date
+      [7, 12] => lambda{|v| convert_date_time(:database_to_application_timestamp, v)},   # datetime
+      [11]  => lambda{|v| convert_date_time(:string_to_time, v)},         # time
+      [249, 250, 251, 252]  => lambda{|v| Sequel::SQL::Blob.new(v)}       # blob
     }
     MYSQL_TYPE_PROCS.each do |k,v|
       k.each{|n| MYSQL_TYPES[n] = v}
     end
     
     @convert_invalid_date_time = false
+    @convert_tinyint_to_bool = true
 
     class << self
-      attr_accessor :convert_invalid_date_time
+      attr_accessor :convert_invalid_date_time, :convert_tinyint_to_bool
     end
 
     # If convert_invalid_date_time is nil, :nil, or :string and
@@ -57,7 +67,7 @@ module Sequel
       include Sequel::MySQL::DatabaseMethods
       
       # Mysql::Error messages that indicate the current connection should be disconnected
-      MYSQL_DATABASE_DISCONNECT_ERRORS = /\ACommands out of sync; you can't run this command now\z/
+      MYSQL_DATABASE_DISCONNECT_ERRORS = /\A(Commands out of sync; you can't run this command now\z|Can't connect to local MySQL server through socket)/
       
       set_adapter_scheme :mysql
       
@@ -83,7 +93,8 @@ module Sequel
       def connect(server)
         opts = server_opts(server)
         conn = Mysql.init
-        conn.options(Mysql::OPT_LOCAL_INFILE, "client")
+        # reads additional options defined under the [client] tag in the mysql configuration file
+        conn.options(Mysql::READ_DEFAULT_GROUP, "client")
         if encoding = opts[:encoding] || opts[:charset]
           # set charset _before_ the connect. using an option instead of "SET (NAMES|CHARACTER_SET_*)" works across reconnects
           conn.options(Mysql::SET_CHARSET_NAME, encoding)
@@ -122,12 +133,12 @@ module Sequel
       # Executes the given SQL using an available connection, yielding the
       # connection if the block is given.
       def execute(sql, opts={}, &block)
-        return call_sproc(sql, opts, &block) if opts[:sproc]
-        return execute_prepared_statement(sql, opts, &block) if Symbol === sql
-        begin
+        if opts[:sproc]
+          call_sproc(sql, opts, &block)
+        elsif sql.is_a?(Symbol)
+          execute_prepared_statement(sql, opts, &block)
+        else
           synchronize(opts[:server]){|conn| _execute(conn, sql, opts, &block)}
-        rescue Mysql::Error => e
-          raise_error(e)
         end
       end
       
@@ -149,8 +160,10 @@ module Sequel
             yield r if r
             if conn.respond_to?(:next_result) && conn.next_result
               loop do
-                r.free
-                r = nil
+                if r
+                  r.free
+                  r = nil
+                end
                 begin
                   r = conn.use_result
                 rescue Mysql::Error
@@ -166,7 +179,16 @@ module Sequel
         rescue Mysql::Error => e
           raise_error(e, :disconnect=>MYSQL_DATABASE_DISCONNECT_ERRORS.match(e.message))
         ensure
-          r.free if r
+          if r
+            r.free 
+            # Use up all results to avoid a commands out of sync message.
+            if conn.respond_to?(:next_result)
+              while conn.next_result
+                r = conn.use_result
+                r.free if r
+              end
+            end
+          end
         end
       end
       
@@ -209,18 +231,17 @@ module Sequel
         synchronize(opts[:server]) do |conn|
           unless conn.prepared_statements[ps_name] == sql
             conn.prepared_statements[ps_name] = sql
-            s = "PREPARE #{ps_name} FROM '#{::Mysql.quote(sql)}'"
-            log_info(s)
-            conn.query(s)
+            _execute(conn, "PREPARE #{ps_name} FROM '#{::Mysql.quote(sql)}'", opts)
           end
           i = 0
-          args.each do |arg|
-            s = "SET @sequel_arg_#{i+=1} = #{literal(arg)}"
-            log_info(s)
-            conn.query(s)
-          end
+          _execute(conn, "SET " + args.map {|arg| "@sequel_arg_#{i+=1} = #{literal(arg)}"}.join(", "), opts) unless args.empty?
           _execute(conn, "EXECUTE #{ps_name}#{" USING #{(1..i).map{|j| "@sequel_arg_#{j}"}.join(', ')}" unless i == 0}", opts, &block)
         end
+      end
+      
+      # Convert tinyint(1) type to boolean if convert_tinyint_to_bool is true
+      def schema_column_type(db_type)
+        Sequel::MySQL.convert_tinyint_to_bool && db_type == 'tinyint(1)' ? :boolean : super
       end
     end
     
@@ -237,6 +258,7 @@ module Sequel
         def subselect_sql(ds)
           ps = ds.to_prepared_statement(:select)
           ps.extend(CallableStatementMethods)
+          ps = ps.bind(@opts[:bind_vars]) if @opts[:bind_vars]
           ps.prepared_args = prepared_args
           ps.prepared_sql
         end
@@ -282,10 +304,10 @@ module Sequel
       # breaks the use of subselects in prepared statements, so extend the
       # temporary prepared statement that this creates with a module that
       # fixes it.
-      def call(type, bind_arguments={}, values=nil)
+      def call(type, bind_arguments={}, *values, &block)
         ps = to_prepared_statement(type, values)
         ps.extend(CallableStatementMethods)
-        ps.call(bind_arguments)
+        ps.call(bind_arguments, &block)
       end
       
       # Delete rows matching this dataset
@@ -293,19 +315,29 @@ module Sequel
         execute_dui(delete_sql){|c| c.affected_rows}
       end
       
-      # Yield all rows matching this dataset
-      def fetch_rows(sql)
+      # Yield all rows matching this dataset.  If the dataset is set to
+      # split multiple statements, yield arrays of hashes one per statement
+      # instead of yielding results for all statements as hashes.
+      def fetch_rows(sql, &block)
         execute(sql) do |r|
           i = -1
           cols = r.fetch_fields.map{|f| [output_identifier(f.name), MYSQL_TYPES[f.type], i+=1]}
           @columns = cols.map{|c| c.first}
-          while row = r.fetch_row
-            h = {}
-            cols.each{|n, p, i| v = row[i]; h[n] = (v && p) ? p.call(v) : v}
-            yield h
+          if opts[:split_multiple_result_sets]
+            s = []
+            yield_rows(r, cols){|h| s << h}
+            yield s
+          else
+            yield_rows(r, cols, &block)
           end
         end
         self
+      end
+      
+      # Don't allow graphing a dataset that splits multiple statements
+      def graph(*)
+        raise(Error, "Can't graph a dataset that splits multiple result sets") if opts[:split_multiple_result_sets]
+        super
       end
       
       # Insert a new value into this dataset
@@ -315,7 +347,7 @@ module Sequel
       
       # Store the given type of prepared statement in the associated database
       # with the given name.
-      def prepare(type, name=nil, values=nil)
+      def prepare(type, name=nil, *values)
         ps = to_prepared_statement(type, values)
         ps.extend(PreparedStatementMethods)
         if name
@@ -328,6 +360,22 @@ module Sequel
       # Replace (update or insert) the matching row.
       def replace(*args)
         execute_dui(replace_sql(*args)){|c| c.insert_id}
+      end
+      
+      # Makes each yield arrays of rows, with each array containing the rows
+      # for a given result set.  Does not work with graphing.  So you can submit
+      # SQL with multiple statements and easily determine which statement
+      # returned which results.
+      #
+      # Modifies the row_proc of the returned dataset so that it still works
+      # as expected (running on the hashes instead of on the arrays of hashes).
+      # If you modify the row_proc afterward, note that it will receive an array
+      # of hashes instead of a hash.
+      def split_multiple_result_sets
+        raise(Error, "Can't split multiple statements on a graphed dataset") if opts[:graph]
+        ds = clone(:split_multiple_result_sets=>true)
+        ds.row_proc = proc{|x| x.map{|h| row_proc.call(h)}} if row_proc
+        ds
       end
       
       # Update the matching rows.
@@ -355,6 +403,16 @@ module Sequel
       # Extend the dataset with the MySQL stored procedure methods.
       def prepare_extend_sproc(ds)
         ds.extend(StoredProcedureMethods)
+      end
+      
+      # Yield each row of the given result set r with columns cols
+      # as a hash with symbol keys
+      def yield_rows(r, cols)
+        while row = r.fetch_row
+          h = {}
+          cols.each{|n, p, i| v = row[i]; h[n] = (v && p) ? p.call(v) : v}
+          yield h
+        end
       end
     end
   end

@@ -92,6 +92,16 @@ context "Dataset" do
     @dataset.identifier_output_method = :reverse
     @dataset.send(:output_identifier, "at_b_C").should == :C_b_ta
   end
+  
+  specify "should have output_identifier handle empty identifiers" do
+    @dataset.send(:output_identifier, "").should == :untitled
+    @dataset.identifier_output_method = :upcase
+    @dataset.send(:output_identifier, "").should == :UNTITLED
+    @dataset.identifier_output_method = :downcase
+    @dataset.send(:output_identifier, "").should == :untitled
+    @dataset.identifier_output_method = :reverse
+    @dataset.send(:output_identifier, "").should == :deltitnu
+  end
 end
 
 context "Dataset#clone" do
@@ -162,6 +172,10 @@ context "A simple dataset" do
     @dataset.delete_sql.should == 'DELETE FROM test'
   end
   
+  specify "should format a truncate statement" do
+    @dataset.truncate_sql.should == 'TRUNCATE TABLE test'
+  end
+  
   specify "should format an insert statement with default values" do
     @dataset.insert_sql.should == 'INSERT INTO test DEFAULT VALUES'
   end
@@ -197,7 +211,7 @@ context "A simple dataset" do
   specify "should format an insert statement with sub-query" do
     @sub = Sequel::Dataset.new(nil).from(:something).filter(:x => 2)
     @dataset.insert_sql(@sub).should == \
-      "INSERT INTO test (SELECT * FROM something WHERE (x = 2))"
+      "INSERT INTO test SELECT * FROM something WHERE (x = 2)"
   end
   
   specify "should format an insert statement with array" do
@@ -223,6 +237,7 @@ context "A simple dataset" do
     ds.insert_sql.should == sql
     ds.delete_sql.should == sql
     ds.update_sql.should == sql
+    ds.truncate_sql.should == sql
   end
 end
 
@@ -237,6 +252,14 @@ context "A dataset with multiple tables in its FROM clause" do
 
   specify "should raise on #delete_sql" do
     proc {@dataset.delete_sql}.should raise_error(Sequel::InvalidOperation)
+  end
+  
+  specify "should raise on #truncate_sql" do
+    proc {@dataset.truncate_sql}.should raise_error(Sequel::InvalidOperation)
+  end
+
+  specify "should raise on #insert_sql" do
+    proc {@dataset.insert_sql}.should raise_error(Sequel::InvalidOperation)
   end
 
   specify "should generate a select query FROM all specified tables" do
@@ -277,14 +300,43 @@ context "Dataset#where" do
       should match(/WHERE \(\(name = 'xyz'\) AND \(price = 342\)\)|WHERE \(\(price = 342\) AND \(name = 'xyz'\)\)/)
   end
   
-  specify "should work with arrays (ala ActiveRecord)" do
+  specify "should work with a string with placeholders and arguments for those placeholders" do
     @dataset.where('price < ? AND id in ?', 100, [1, 2, 3]).select_sql.should ==
       "SELECT * FROM test WHERE (price < 100 AND id in (1, 2, 3))"
   end
   
+  specify "should not modify passed array with placeholders" do
+    a = ['price < ? AND id in ?', 100, 1, 2, 3]
+    b = a.dup
+    @dataset.where(a)
+    b.should == a
+  end
+
   specify "should work with strings (custom SQL expressions)" do
     @dataset.where('(a = 1 AND b = 2)').select_sql.should ==
       "SELECT * FROM test WHERE ((a = 1 AND b = 2))"
+  end
+    
+  specify "should work with a string with named placeholders and a hash of placeholder value arguments" do
+    @dataset.where('price < :price AND id in :ids', :price=>100, :ids=>[1, 2, 3]).select_sql.should ==
+      "SELECT * FROM test WHERE (price < 100 AND id in (1, 2, 3))"
+  end
+    
+  specify "should not modify passed array with named placeholders" do
+    a = ['price < :price AND id in :ids', {:price=>100}]
+    b = a.dup
+    @dataset.where(a)
+    b.should == a
+  end
+
+  specify "should not replace named placeholders that don't existin in the hash" do
+    @dataset.where('price < :price AND id in :ids', :price=>100).select_sql.should ==
+      "SELECT * FROM test WHERE (price < 100 AND id in :ids)"
+  end
+    
+  specify "should handle partial names" do
+    @dataset.where('price < :price AND id = :p', :p=>2, :price=>100).select_sql.should ==
+      "SELECT * FROM test WHERE (price < 100 AND id = 2)"
   end
   
   specify "should affect select, delete and update statements" do
@@ -345,12 +397,6 @@ context "Dataset#where" do
   specify "should be composable using AND operator (for scoping) with block" do
     @d3.where{:e.sql_number < 5}.select_sql.should ==
       "SELECT * FROM test WHERE ((a = 1) AND (e < 5))"
-  end
-  
-  specify "should raise if the dataset is grouped" do
-    proc {@dataset.group(:t).where(:a => 1)}.should_not raise_error
-    @dataset.group(:t).where(:a => 1).sql.should ==
-      "SELECT * FROM test WHERE (a = 1) GROUP BY t"
   end
   
   specify "should accept ranges" do
@@ -609,10 +655,6 @@ context "Dataset#having" do
     @columns = "region, sum(population), avg(gdp)"
   end
 
-  specify "should raise if the dataset is not grouped" do
-    proc {@dataset.having('avg(gdp) > 10')}.should raise_error(Sequel::InvalidOperation)
-  end
-
   specify "should affect select statements" do
     @d1.select_sql.should ==
       "SELECT #{@columns} FROM test GROUP BY region HAVING (sum(population) > 10)"
@@ -640,6 +682,14 @@ context "a grouped dataset" do
 
   specify "should raise when trying to generate a delete statement" do
     proc {@dataset.delete_sql}.should raise_error
+  end
+  
+  specify "should raise when trying to generate a truncate statement" do
+    proc {@dataset.truncate_sql}.should raise_error
+  end
+
+  specify "should raise when trying to generate an insert statement" do
+    proc {@dataset.insert_sql}.should raise_error
   end
 
   specify "should specify the grouping in generated select statement" do
@@ -672,11 +722,22 @@ context "Dataset#group_by" do
       "SELECT * FROM test GROUP BY type_id"
     @dataset.group_by(:a, :b).select_sql.should ==
       "SELECT * FROM test GROUP BY a, b"
-  end
-
-  specify "should specify the grouping in generated select statement" do
     @dataset.group_by(:type_id=>nil).select_sql.should ==
       "SELECT * FROM test GROUP BY (type_id IS NULL)"
+  end
+
+  specify "should ungroup when passed nil, empty, or no arguments" do
+    @dataset.group_by.select_sql.should ==
+      "SELECT * FROM test"
+    @dataset.group_by(nil).select_sql.should ==
+      "SELECT * FROM test"
+  end
+
+  specify "should undo previous grouping" do
+    @dataset.group_by(:a).group_by(:b).select_sql.should ==
+      "SELECT * FROM test GROUP BY b"
+    @dataset.group_by(:a, :b).group_by.select_sql.should ==
+      "SELECT * FROM test"
   end
 
   specify "should be aliased as #group" do
@@ -732,8 +793,20 @@ context "Dataset#literal" do
     @dataset.literal(:items__name).should == "items.name"
   end
   
-  specify "should raise an error for unsupported types" do
-    proc {@dataset.literal({})}.should raise_error
+  specify "should call sql_literal with dataset on type if not natively supported and the object responds to it" do
+    @a = Class.new do
+      def sql_literal(ds)
+        "called #{ds.blah}"
+      end
+    end
+    def @dataset.blah
+      "ds"
+    end
+    @dataset.literal(@a.new).should == "called ds"
+  end
+  
+  specify "should raise an error for unsupported types with no sql_literal method" do
+    proc {@dataset.literal(Object.new)}.should raise_error
   end
   
   specify "should literalize datasets as subqueries" do
@@ -743,20 +816,70 @@ context "Dataset#literal" do
   
   specify "should literalize Time properly" do
     t = Time.now
-    s = t.strftime("'%Y-%m-%dT%H:%M:%S%z'").gsub(/(\d\d')\z/, ':\1')
-    @dataset.literal(t).should == s
+    s = t.strftime("'%Y-%m-%d %H:%M:%S")
+    @dataset.literal(t).should == "#{s}.#{sprintf('%06i', t.usec)}'"
   end
   
   specify "should literalize DateTime properly" do
     t = DateTime.now
-    s = t.strftime("'%Y-%m-%dT%H:%M:%S%z'").gsub(/(\d\d')\z/, ':\1')
-    @dataset.literal(t).should == s
+    s = t.strftime("'%Y-%m-%d %H:%M:%S")
+    @dataset.literal(t).should == "#{s}.#{sprintf('%06i', t.sec_fraction* 86400000000)}'"
   end
   
   specify "should literalize Date properly" do
     d = Date.today
     s = d.strftime("'%Y-%m-%d'")
     @dataset.literal(d).should == s
+  end
+
+  specify "should literalize Time, DateTime, Date properly if SQL standard format is required" do
+    @dataset.meta_def(:requires_sql_standard_datetimes?){true}
+
+    t = Time.now
+    s = t.strftime("TIMESTAMP '%Y-%m-%d %H:%M:%S")
+    @dataset.literal(t).should == "#{s}.#{sprintf('%06i', t.usec)}'"
+
+    t = DateTime.now
+    s = t.strftime("TIMESTAMP '%Y-%m-%d %H:%M:%S")
+    @dataset.literal(t).should == "#{s}.#{sprintf('%06i', t.sec_fraction* 86400000000)}'"
+
+    d = Date.today
+    s = d.strftime("DATE '%Y-%m-%d'")
+    @dataset.literal(d).should == s
+  end
+  
+  specify "should literalize Time and DateTime properly if the database support timezones in timestamps" do
+    @dataset.meta_def(:supports_timestamp_timezones?){true}
+
+    t = Time.now.utc
+    s = t.strftime("'%Y-%m-%d %H:%M:%S")
+    @dataset.literal(t).should == "#{s}.#{sprintf('%06i', t.usec)}+0000'"
+
+    t = DateTime.now.new_offset(0)
+    s = t.strftime("'%Y-%m-%d %H:%M:%S")
+    @dataset.literal(t).should == "#{s}.#{sprintf('%06i', t.sec_fraction* 86400000000)}+0000'"
+  end
+  
+  specify "should literalize Time and DateTime properly if the database doesn't support usecs in timestamps" do
+    @dataset.meta_def(:supports_timestamp_usecs?){false}
+    
+    t = Time.now.utc
+    s = t.strftime("'%Y-%m-%d %H:%M:%S")
+    @dataset.literal(t).should == "#{s}'"
+
+    t = DateTime.now.new_offset(0)
+    s = t.strftime("'%Y-%m-%d %H:%M:%S")
+    @dataset.literal(t).should == "#{s}'"
+    
+    @dataset.meta_def(:supports_timestamp_timezones?){true}
+    
+    t = Time.now.utc
+    s = t.strftime("'%Y-%m-%d %H:%M:%S")
+    @dataset.literal(t).should == "#{s}+0000'"
+
+    t = DateTime.now.new_offset(0)
+    s = t.strftime("'%Y-%m-%d %H:%M:%S")
+    @dataset.literal(t).should == "#{s}+0000'"
   end
   
   specify "should not modify literal strings" do
@@ -992,24 +1115,26 @@ context "Dataset#order" do
 end
 
 context "Dataset#unfiltered" do
-  before do
-    @dataset = Sequel::Dataset.new(nil).from(:test)
-  end
-  
   specify "should remove filtering from the dataset" do
-    @dataset.filter(:score=>1).unfiltered.sql.should ==
-      'SELECT * FROM test'
+    Sequel::Dataset.new(nil).from(:test).filter(:score=>1).unfiltered.sql.should == 'SELECT * FROM test'
+  end
+end
+
+context "Dataset#unlimited" do
+  specify "should remove limit and offset from the dataset" do
+    Sequel::Dataset.new(nil).from(:test).limit(1, 2).unlimited.sql.should == 'SELECT * FROM test'
+  end
+end
+
+context "Dataset#ungrouped" do
+  specify "should remove group and having clauses from the dataset" do
+    Sequel::Dataset.new(nil).from(:test).group(:a).having(:b).ungrouped.sql.should == 'SELECT * FROM test'
   end
 end
 
 context "Dataset#unordered" do
-  before do
-    @dataset = Sequel::Dataset.new(nil).from(:test)
-  end
-  
   specify "should remove ordering from the dataset" do
-    @dataset.order(:name).unordered.sql.should ==
-      'SELECT * FROM test'
+    Sequel::Dataset.new(nil).from(:test).order(:name).unordered.sql.should == 'SELECT * FROM test'
   end
 end
 
@@ -1018,10 +1143,18 @@ context "Dataset#with_sql" do
     @dataset = Sequel::Dataset.new(nil).from(:test)
   end
   
-  specify "should remove use static sql" do
+  specify "should use static sql" do
     @dataset.with_sql('SELECT 1 FROM test').sql.should == 'SELECT 1 FROM test'
   end
   
+  specify "should work with placeholders" do
+    @dataset.with_sql('SELECT ? FROM test', 1).sql.should == 'SELECT 1 FROM test'
+  end
+
+  specify "should work with named placeholders" do
+    @dataset.with_sql('SELECT :x FROM test', :x=>1).sql.should == 'SELECT 1 FROM test'
+  end
+
   specify "should keep row_proc" do
     @dataset.with_sql('SELECT 1 FROM test').row_proc.should == @dataset.row_proc
   end
@@ -1249,6 +1382,12 @@ context "Dataset#distinct" do
     @dataset.distinct.sql.should == 'SELECT DISTINCT name FROM test'
   end
   
+  specify "should raise an error if columns given and distinct on not supported" do
+    @dataset.meta_def(:supports_distinct_on?){false}
+    proc{@dataset.distinct}.should_not raise_error
+    proc{@dataset.distinct(:a)}.should raise_error(Sequel::InvalidOperation)
+  end
+  
   specify "should accept an expression list" do
     @dataset.distinct(:a, :b).sql.should == 'SELECT DISTINCT ON (a, b) name FROM test'
     @dataset.distinct(:stamp.cast(:integer), :node_id=>nil).sql.should == 'SELECT DISTINCT ON (CAST(stamp AS integer), (node_id IS NULL)) name FROM test'
@@ -1346,6 +1485,11 @@ context "Dataset#group_and_count" do
     @ds.group_and_count(:a, :b).sql.should == 
       "SELECT a, b, count(*) AS count FROM test GROUP BY a, b ORDER BY count"
   end
+
+  specify "should format column aliases in the select clause but not in the group clause" do
+    @ds.group_and_count(:name___n).sql.should ==
+      "SELECT name AS n, count(*) AS count FROM test GROUP BY name ORDER BY count"
+  end
 end
 
 context "Dataset#empty?" do
@@ -1364,6 +1508,25 @@ context "Dataset#empty?" do
     @c.sql.should == 'SELECT 1 FROM test LIMIT 1'
     @c.new(nil).from(:test).filter(false).should be_empty
     @c.sql.should == "SELECT 1 FROM test WHERE 'f' LIMIT 1"
+  end
+end
+
+context "Dataset#from_self" do
+  before do
+    @ds = Sequel::Dataset.new(nil).from(:test).select(:name).limit(1)
+  end
+  specify "should set up a default alias" do
+    @ds.from_self.sql.should == 'SELECT * FROM (SELECT name FROM test LIMIT 1) AS t1'
+  end
+  specify "should modify only the new dataset" do
+    @ds.from_self.select(:bogus).sql.should == 'SELECT bogus FROM (SELECT name FROM test LIMIT 1) AS t1'
+  end
+  specify "should use the user-specified alias" do
+    @ds.from_self(:alias=>:some_name).sql.should == 'SELECT * FROM (SELECT name FROM test LIMIT 1) AS some_name'
+  end
+  specify "should use the user-specified alias for joins" do
+    @ds.from_self(:alias=>:some_name).inner_join(:posts, :alias=>:name).sql.should == \
+      'SELECT * FROM (SELECT name FROM test LIMIT 1) AS some_name INNER JOIN posts ON (posts.alias = some_name.name)'
   end
 end
 
@@ -1398,38 +1561,54 @@ context "Dataset#join_table" do
       'SELECT * FROM "items" INNER JOIN "b" ON ("b"."items_id" = "items"."id") LEFT OUTER JOIN "c" ON ("c"."b_id" = "b"."id")'
   end
   
-  specify "should support left outer joins" do
-    @d.join_table(:left_outer, :categories, :category_id=>:id).sql.should ==
-      'SELECT * FROM "items" LEFT OUTER JOIN "categories" ON ("categories"."category_id" = "items"."id")'
+  specify "should support arbitrary join types" do
+    @d.join_table(:magic, :categories, :category_id=>:id).sql.should ==
+      'SELECT * FROM "items" MAGIC JOIN "categories" ON ("categories"."category_id" = "items"."id")'
+  end
 
+  specify "should support many join methods" do
     @d.left_outer_join(:categories, :category_id=>:id).sql.should ==
       'SELECT * FROM "items" LEFT OUTER JOIN "categories" ON ("categories"."category_id" = "items"."id")'
-  end
-
-  specify "should support right outer joins" do
-    @d.join_table(:right_outer, :categories, :category_id=>:id).sql.should ==
-      'SELECT * FROM "items" RIGHT OUTER JOIN "categories" ON ("categories"."category_id" = "items"."id")'
-
     @d.right_outer_join(:categories, :category_id=>:id).sql.should ==
       'SELECT * FROM "items" RIGHT OUTER JOIN "categories" ON ("categories"."category_id" = "items"."id")'
-  end
-
-  specify "should support full outer joins" do
-    @d.join_table(:full_outer, :categories, :category_id=>:id).sql.should ==
-      'SELECT * FROM "items" FULL OUTER JOIN "categories" ON ("categories"."category_id" = "items"."id")'
-
     @d.full_outer_join(:categories, :category_id=>:id).sql.should ==
       'SELECT * FROM "items" FULL OUTER JOIN "categories" ON ("categories"."category_id" = "items"."id")'
-  end
-
-  specify "should support inner joins" do
-    @d.join_table(:inner, :categories, :category_id=>:id).sql.should ==
-      'SELECT * FROM "items" INNER JOIN "categories" ON ("categories"."category_id" = "items"."id")'
-
     @d.inner_join(:categories, :category_id=>:id).sql.should ==
       'SELECT * FROM "items" INNER JOIN "categories" ON ("categories"."category_id" = "items"."id")'
+    @d.left_join(:categories, :category_id=>:id).sql.should ==
+      'SELECT * FROM "items" LEFT JOIN "categories" ON ("categories"."category_id" = "items"."id")'
+    @d.right_join(:categories, :category_id=>:id).sql.should ==
+      'SELECT * FROM "items" RIGHT JOIN "categories" ON ("categories"."category_id" = "items"."id")'
+    @d.full_join(:categories, :category_id=>:id).sql.should ==
+      'SELECT * FROM "items" FULL JOIN "categories" ON ("categories"."category_id" = "items"."id")'
+    @d.natural_join(:categories).sql.should ==
+      'SELECT * FROM "items" NATURAL JOIN "categories"'
+    @d.natural_left_join(:categories).sql.should ==
+      'SELECT * FROM "items" NATURAL LEFT JOIN "categories"'
+    @d.natural_right_join(:categories).sql.should ==
+      'SELECT * FROM "items" NATURAL RIGHT JOIN "categories"'
+    @d.natural_full_join(:categories).sql.should ==
+      'SELECT * FROM "items" NATURAL FULL JOIN "categories"'
+    @d.cross_join(:categories).sql.should ==
+      'SELECT * FROM "items" CROSS JOIN "categories"'
   end
   
+  specify "should raise an error if additional arguments are provided to join methods that don't take conditions" do
+    proc{@d.natural_join(:categories, :id=>:id)}.should raise_error(ArgumentError)
+    proc{@d.natural_left_join(:categories, :id=>:id)}.should raise_error(ArgumentError)
+    proc{@d.natural_right_join(:categories, :id=>:id)}.should raise_error(ArgumentError)
+    proc{@d.natural_full_join(:categories, :id=>:id)}.should raise_error(ArgumentError)
+    proc{@d.cross_join(:categories, :id=>:id)}.should raise_error(ArgumentError)
+  end
+
+  specify "should raise an error if blocks are provided to join methods that don't pass them" do
+    proc{@d.natural_join(:categories){}}.should raise_error(Sequel::Error)
+    proc{@d.natural_left_join(:categories){}}.should raise_error(Sequel::Error)
+    proc{@d.natural_right_join(:categories){}}.should raise_error(Sequel::Error)
+    proc{@d.natural_full_join(:categories){}}.should raise_error(Sequel::Error)
+    proc{@d.cross_join(:categories){}}.should raise_error(Sequel::Error)
+  end
+
   specify "should default to a plain join if nil is used for the type" do
     @d.join_table(nil, :categories, :category_id=>:id).sql.should ==
       'SELECT * FROM "items"  JOIN "categories" ON ("categories"."category_id" = "items"."id")'
@@ -1567,6 +1746,11 @@ context "Dataset#join_table" do
       'SELECT * FROM "items" INNER JOIN "categories" USING ("id1", "id2")'
   end
 
+  specify "should emulate JOIN USING (poorly) if the dataset doesn't support it" do
+    @d.meta_def(:supports_join_using?){false}
+    @d.join(:categories, [:id]).sql.should == 'SELECT * FROM "items" INNER JOIN "categories" ON ("categories"."id" = "items"."id")'
+  end
+
   specify "should raise an error if using an array of symbols with a block" do
     proc{@d.join(:categories, [:id]){|j,lj,js|}}.should raise_error(Sequel::Error)
   end
@@ -1632,6 +1816,13 @@ context "Dataset#join_table" do
       'SELECT * FROM "items" INNER JOIN "categories" ON (("categories"."a" = "items"."d") AND ("categories"."b" = "items"."c"))'
     @d.join(:categories, :a=>:d){|j,lj,js| :b.qualify(j) > :c.qualify(lj)}.sql.should ==
       'SELECT * FROM "items" INNER JOIN "categories" ON (("categories"."a" = "items"."d") AND ("categories"."b" > "items"."c"))'
+  end
+  
+  specify "should not allow insert, update, delete, or truncate" do
+    proc{@d.join(:categories, :a=>:d).insert_sql}.should raise_error(Sequel::InvalidOperation)
+    proc{@d.join(:categories, :a=>:d).update_sql(:a=>1)}.should raise_error(Sequel::InvalidOperation)
+    proc{@d.join(:categories, :a=>:d).delete_sql}.should raise_error(Sequel::InvalidOperation)
+    proc{@d.join(:categories, :a=>:d).truncate_sql}.should raise_error(Sequel::InvalidOperation)
   end
 end
 
@@ -1732,6 +1923,14 @@ context "Dataset aggregate methods" do
   specify "should accept qualified columns" do
     @d.avg(:test__bc).should == 'SELECT avg(test.bc) FROM test LIMIT 1'
   end
+  
+  specify "should use a subselect for the same conditions as count" do
+    d = @d.order(:a).limit(5)
+    d.avg(:a).should == 'SELECT avg(a) FROM (SELECT * FROM test ORDER BY a LIMIT 5) AS t1 LIMIT 1'
+    d.sum(:a).should == 'SELECT sum(a) FROM (SELECT * FROM test ORDER BY a LIMIT 5) AS t1 LIMIT 1'
+    d.min(:a).should == 'SELECT min(a) FROM (SELECT * FROM test ORDER BY a LIMIT 5) AS t1 LIMIT 1'
+    d.max(:a).should == 'SELECT max(a) FROM (SELECT * FROM test ORDER BY a LIMIT 5) AS t1 LIMIT 1'
+  end
 end
 
 context "Dataset#range" do
@@ -1760,6 +1959,11 @@ context "Dataset#range" do
   specify "should return a range object" do
     @d.range(:tryme).should == (1..10)
   end
+  
+  specify "should use a subselect for the same conditions as count" do
+    @d.order(:stamp).limit(5).range(:stamp).should == (1..10)
+    @d.last_sql.should == 'SELECT min(stamp) AS v1, max(stamp) AS v2 FROM (SELECT * FROM test ORDER BY stamp LIMIT 5) AS t1 LIMIT 1'
+  end
 end
 
 context "Dataset#interval" do
@@ -1787,6 +1991,11 @@ context "Dataset#interval" do
   
   specify "should return an integer" do
     @d.interval(:tryme).should == 1234
+  end
+  
+  specify "should use a subselect for the same conditions as count" do
+    @d.order(:stamp).limit(5).interval(:stamp).should == 1234
+    @d.last_sql.should == 'SELECT (max(stamp) - min(stamp)) FROM (SELECT * FROM test ORDER BY stamp LIMIT 5) AS t1 LIMIT 1'
   end
 end
 
@@ -1864,12 +2073,16 @@ context "Dataset compound operations" do
       "SELECT * FROM (SELECT * FROM a WHERE (z = 1) UNION SELECT * FROM b WHERE (z = 2)) AS t1"
     @b.union(@a, true).sql.should == \
       "SELECT * FROM (SELECT * FROM b WHERE (z = 2) UNION ALL SELECT * FROM a WHERE (z = 1)) AS t1"
+    @b.union(@a, :all=>true).sql.should == \
+      "SELECT * FROM (SELECT * FROM b WHERE (z = 2) UNION ALL SELECT * FROM a WHERE (z = 1)) AS t1"
   end
 
   specify "should support INTERSECT and INTERSECT ALL" do
     @a.intersect(@b).sql.should == \
       "SELECT * FROM (SELECT * FROM a WHERE (z = 1) INTERSECT SELECT * FROM b WHERE (z = 2)) AS t1"
     @b.intersect(@a, true).sql.should == \
+      "SELECT * FROM (SELECT * FROM b WHERE (z = 2) INTERSECT ALL SELECT * FROM a WHERE (z = 1)) AS t1"
+    @b.intersect(@a, :all=>true).sql.should == \
       "SELECT * FROM (SELECT * FROM b WHERE (z = 2) INTERSECT ALL SELECT * FROM a WHERE (z = 1)) AS t1"
   end
 
@@ -1878,6 +2091,40 @@ context "Dataset compound operations" do
       "SELECT * FROM (SELECT * FROM a WHERE (z = 1) EXCEPT SELECT * FROM b WHERE (z = 2)) AS t1"
     @b.except(@a, true).sql.should == \
       "SELECT * FROM (SELECT * FROM b WHERE (z = 2) EXCEPT ALL SELECT * FROM a WHERE (z = 1)) AS t1"
+    @b.except(@a, :all=>true).sql.should == \
+      "SELECT * FROM (SELECT * FROM b WHERE (z = 2) EXCEPT ALL SELECT * FROM a WHERE (z = 1)) AS t1"
+  end
+    
+  specify "should support :from_self=>false option to not wrap the compound in a SELECT * FROM (...)" do
+    @b.union(@a, :from_self=>false).sql.should == \
+      "SELECT * FROM b WHERE (z = 2) UNION SELECT * FROM a WHERE (z = 1)"
+    @b.intersect(@a, :from_self=>false).sql.should == \
+      "SELECT * FROM b WHERE (z = 2) INTERSECT SELECT * FROM a WHERE (z = 1)"
+    @b.except(@a, :from_self=>false).sql.should == \
+      "SELECT * FROM b WHERE (z = 2) EXCEPT SELECT * FROM a WHERE (z = 1)"
+      
+    @b.union(@a, :from_self=>false, :all=>true).sql.should == \
+      "SELECT * FROM b WHERE (z = 2) UNION ALL SELECT * FROM a WHERE (z = 1)"
+    @b.intersect(@a, :from_self=>false, :all=>true).sql.should == \
+      "SELECT * FROM b WHERE (z = 2) INTERSECT ALL SELECT * FROM a WHERE (z = 1)"
+    @b.except(@a, :from_self=>false, :all=>true).sql.should == \
+      "SELECT * FROM b WHERE (z = 2) EXCEPT ALL SELECT * FROM a WHERE (z = 1)"
+  end
+
+  specify "should raise an InvalidOperation if INTERSECT or EXCEPT is used and they are not supported" do
+    @a.meta_def(:supports_intersect_except?){false}
+    proc{@a.intersect(@b)}.should raise_error(Sequel::InvalidOperation)
+    proc{@a.intersect(@b, true)}.should raise_error(Sequel::InvalidOperation)
+    proc{@a.except(@b)}.should raise_error(Sequel::InvalidOperation)
+    proc{@a.except(@b, true)}.should raise_error(Sequel::InvalidOperation)
+  end
+    
+  specify "should raise an InvalidOperation if INTERSECT ALL or EXCEPT ALL is used and they are not supported" do
+    @a.meta_def(:supports_intersect_except_all?){false}
+    proc{@a.intersect(@b)}.should_not raise_error
+    proc{@a.intersect(@b, true)}.should raise_error(Sequel::InvalidOperation)
+    proc{@a.except(@b)}.should_not raise_error
+    proc{@a.except(@b, true)}.should raise_error(Sequel::InvalidOperation)
   end
     
   specify "should handle chained compound operations" do
@@ -2169,7 +2416,7 @@ context "Dataset#import" do
     @ds.import([:x, :y], @ds2)
     @db.sqls.should == [
       'BEGIN',
-      "INSERT INTO items (x, y) VALUES (SELECT a, b FROM cats WHERE (purr IS TRUE))",
+      "INSERT INTO items (x, y) SELECT a, b FROM cats WHERE (purr IS TRUE)",
       'COMMIT'
     ]
   end
@@ -2428,6 +2675,56 @@ context "Dataset#insert_sql" do
   specify "should raise an Error if the dataset has no sources" do
     proc{Sequel::Database.new.dataset.insert_sql}.should raise_error(Sequel::Error)
   end
+  
+  specify "should accept datasets" do
+    @ds.insert_sql(@ds).should == "INSERT INTO items SELECT * FROM items"
+  end
+  
+  specify "should accept datasets with columns" do
+    @ds.insert_sql([:a, :b], @ds).should == "INSERT INTO items (a, b) SELECT * FROM items"
+  end
+  
+  specify "should raise if given bad values" do
+    proc{@ds.clone(:values=>'a').send(:_insert_sql)}.should raise_error(Sequel::Error)
+  end
+  
+  specify "should accept separate values" do
+    @ds.insert_sql(1).should == "INSERT INTO items VALUES (1)"
+    @ds.insert_sql(1, 2).should == "INSERT INTO items VALUES (1, 2)"
+    @ds.insert_sql(1, 2, 3).should == "INSERT INTO items VALUES (1, 2, 3)"
+  end
+  
+  specify "should accept a single array of values" do
+    @ds.insert_sql([1, 2, 3]).should == "INSERT INTO items VALUES (1, 2, 3)"
+  end
+  
+  specify "should accept an array of columns and an array of values" do
+    @ds.insert_sql([:a, :b, :c], [1, 2, 3]).should == "INSERT INTO items (a, b, c) VALUES (1, 2, 3)"
+  end
+  
+  specify "should raise an array if the columns and values differ in size" do
+    proc{@ds.insert_sql([:a, :b], [1, 2, 3])}.should raise_error(Sequel::Error)
+  end
+  
+  specify "should accept a single LiteralString" do
+    @ds.insert_sql('VALUES (1, 2, 3)'.lit).should == "INSERT INTO items VALUES (1, 2, 3)"
+  end
+  
+  specify "should accept an array of columns and an LiteralString" do
+    @ds.insert_sql([:a, :b, :c], 'VALUES (1, 2, 3)'.lit).should == "INSERT INTO items (a, b, c) VALUES (1, 2, 3)"
+  end
+  
+  specify "should accept an object that responds to values and returns a hash by using that hash as the columns and values" do
+    o = Object.new
+    def o.values; {:c=>'d'}; end
+    @ds.insert_sql(o).should == "INSERT INTO items (c) VALUES ('d')"
+  end
+  
+  specify "should accept an object that responds to values and returns something other than a hash by using the object itself as a single value" do
+    o = Date.civil(2000, 1, 1)
+    def o.values; self; end
+    @ds.insert_sql(o).should == "INSERT INTO items VALUES ('2000-01-01')"
+  end
 end
 
 class DummyMummyDataset < Sequel::Dataset
@@ -2532,7 +2829,7 @@ context "Dataset#grep" do
   end
 end
 
-context "Dataset default #fetch_rows, #insert, #update, and #delete, #execute" do
+context "Dataset default #fetch_rows, #insert, #update, #delete, #truncate, #execute" do
   before do
     @db = Sequel::Database.new
     @ds = @db[:items]
@@ -2545,16 +2842,33 @@ context "Dataset default #fetch_rows, #insert, #update, and #delete, #execute" d
   specify "#delete should execute delete SQL" do
     @db.should_receive(:execute).once.with('DELETE FROM items', :server=>:default)
     @ds.delete
+    @db.should_receive(:execute_dui).once.with('DELETE FROM items', :server=>:default)
+    @ds.delete
   end
 
   specify "#insert should execute insert SQL" do
     @db.should_receive(:execute).once.with('INSERT INTO items DEFAULT VALUES', :server=>:default)
+    @ds.insert([])
+    @db.should_receive(:execute_insert).once.with('INSERT INTO items DEFAULT VALUES', :server=>:default)
     @ds.insert([])
   end
 
   specify "#update should execute update SQL" do
     @db.should_receive(:execute).once.with('UPDATE items SET number = 1', :server=>:default)
     @ds.update(:number=>1)
+    @db.should_receive(:execute_dui).once.with('UPDATE items SET number = 1', :server=>:default)
+    @ds.update(:number=>1)
+  end
+  
+  specify "#truncate should execute truncate SQL" do
+    @db.should_receive(:execute).once.with('TRUNCATE TABLE items', :server=>:default)
+    @ds.truncate.should == nil
+    @db.should_receive(:execute_ddl).once.with('TRUNCATE TABLE items', :server=>:default)
+    @ds.truncate.should == nil
+  end
+  
+  specify "#truncate should raise an InvalidOperation exception if the dataset is filtered" do
+    proc{@ds.filter(:a=>1).truncate}.should raise_error(Sequel::InvalidOperation)
   end
   
   specify "#execute should execute the SQL on the database" do
@@ -2762,8 +3076,18 @@ context "Sequel::Dataset #set_overrides" do
   end
 end
 
+context "Sequel::Dataset#qualify" do
+  specify "should qualify to the given table" do
+    MockDatabase.new[:t].filter{a<b}.qualify(:e).sql.should == 'SELECT e.* FROM t WHERE (e.a < e.b)'
+  end
+
+  specify "should qualify to the first source if no table if given" do
+    MockDatabase.new[:t].filter{a<b}.qualify.sql.should == 'SELECT t.* FROM t WHERE (t.a < t.b)'
+  end
+end
+
 context "Sequel::Dataset#qualify_to" do
-  specify "should qualify_to the first source" do
+  specify "should qualify to the given table" do
     MockDatabase.new[:t].filter{a<b}.qualify_to(:e).sql.should == 'SELECT e.* FROM t WHERE (e.a < e.b)'
   end
 end
@@ -2841,8 +3165,223 @@ context "Sequel::Dataset#qualify_to_first_source" do
     @ds.filter{a.sql_subscript(b,3)}.qualify_to_first_source.sql.should == 'SELECT t.* FROM t WHERE t.a[t.b, 3]'
   end
 
+  specify "should handle SQL::PlaceholderLiteralStrings" do
+    @ds.filter('? > ?', :a, 1).qualify_to_first_source.sql.should == 'SELECT t.* FROM t WHERE (t.a > 1)'
+  end
+
+  specify "should handle SQL::PlaceholderLiteralStrings with named placeholders" do
+    @ds.filter(':a > :b', :a=>:c, :b=>1).qualify_to_first_source.sql.should == 'SELECT t.* FROM t WHERE (t.c > 1)'
+  end
+
+  specify "should handle SQL::WindowFunctions" do
+    @ds.meta_def(:supports_window_functions?){true}
+    @ds.select{sum(:over, :args=>:a, :partition=>:b, :order=>:c){}}.qualify_to_first_source.sql.should == 'SELECT sum(t.a) OVER (PARTITION BY t.b ORDER BY t.c) FROM t'
+  end
+
   specify "should handle all other objects by returning them unchanged" do
-    @ds.select("a").filter{a(3)}.filter('blah').order('true'.lit).group('?'.lit(:a)).having(false).qualify_to_first_source.sql.should == \
-      "SELECT 'a' FROM t WHERE (a(3) AND (blah)) GROUP BY a HAVING 'f' ORDER BY true"
+    @ds.select("a").filter{a(3)}.filter('blah').order('true'.lit).group('a > ?'.lit(1)).having(false).qualify_to_first_source.sql.should == \
+      "SELECT 'a' FROM t WHERE (a(3) AND (blah)) GROUP BY a > 1 HAVING 'f' ORDER BY true"
+  end
+end
+
+context "Sequel::Dataset #with and #with_recursive" do
+  before do
+    @db = MockDatabase.new
+    @ds = @db[:t]
+  end
+  
+  specify "#with should take a name and dataset and use a WITH clause" do
+    @ds.with(:t, @db[:x]).sql.should == 'WITH t AS (SELECT * FROM x) SELECT * FROM t'
+  end
+
+  specify "#with_recursive should take a name, nonrecursive dataset, and recursive dataset, and use a WITH clause" do
+    @ds.with_recursive(:t, @db[:x], @db[:t]).sql.should == 'WITH t AS (SELECT * FROM x UNION ALL SELECT * FROM t) SELECT * FROM t'
+  end
+  
+  specify "#with and #with_recursive should add to existing WITH clause if called multiple times" do
+    @ds.with(:t, @db[:x]).with(:j, @db[:y]).sql.should == 'WITH t AS (SELECT * FROM x), j AS (SELECT * FROM y) SELECT * FROM t'
+    @ds.with_recursive(:t, @db[:x], @db[:t]).with_recursive(:j, @db[:y], @db[:j]).sql.should == 'WITH t AS (SELECT * FROM x UNION ALL SELECT * FROM t), j AS (SELECT * FROM y UNION ALL SELECT * FROM j) SELECT * FROM t'
+    @ds.with(:t, @db[:x]).with_recursive(:j, @db[:y], @db[:j]).sql.should == 'WITH t AS (SELECT * FROM x), j AS (SELECT * FROM y UNION ALL SELECT * FROM j) SELECT * FROM t'
+  end
+  
+  specify "#with and #with_recursive should take an :args option" do
+    @ds.with(:t, @db[:x], :args=>[:b]).sql.should == 'WITH t(b) AS (SELECT * FROM x) SELECT * FROM t'
+    @ds.with_recursive(:t, @db[:x], @db[:t], :args=>[:b, :c]).sql.should == 'WITH t(b, c) AS (SELECT * FROM x UNION ALL SELECT * FROM t) SELECT * FROM t'
+  end
+  
+  specify "#with_recursive should take an :union_all=>false option" do
+    @ds.with_recursive(:t, @db[:x], @db[:t], :union_all=>false).sql.should == 'WITH t AS (SELECT * FROM x UNION SELECT * FROM t) SELECT * FROM t'
+  end
+
+  specify "#with and #with_recursive should raise an error unless the dataset supports CTEs" do
+    @ds.meta_def(:supports_cte?){false}
+    proc{@ds.with(:t, @db[:x], :args=>[:b])}.should raise_error(Sequel::Error)
+    proc{@ds.with_recursive(:t, @db[:x], @db[:t], :args=>[:b, :c])}.should raise_error(Sequel::Error)
+  end
+end
+
+describe Sequel::SQL::Constants do
+  before do
+    @db = MockDatabase.new
+  end
+  
+  it "should have CURRENT_DATE" do
+    @db.literal(Sequel::SQL::Constants::CURRENT_DATE) == 'CURRENT_DATE'
+    @db.literal(Sequel::CURRENT_DATE) == 'CURRENT_DATE'
+  end
+
+  it "should have CURRENT_TIME" do
+    @db.literal(Sequel::SQL::Constants::CURRENT_TIME) == 'CURRENT_TIME'
+    @db.literal(Sequel::CURRENT_TIME) == 'CURRENT_TIME'
+  end
+
+  it "should have CURRENT_TIMESTAMP" do
+    @db.literal(Sequel::SQL::Constants::CURRENT_TIMESTAMP) == 'CURRENT_TIMESTAMP'
+    @db.literal(Sequel::CURRENT_TIMESTAMP) == 'CURRENT_TIMESTAMP'
+  end
+end
+
+describe "Sequel timezone support" do
+  before do
+    @db = MockDatabase.new
+    @dataset = @db.dataset
+    @dataset.meta_def(:supports_timestamp_timezones?){true}
+    @dataset.meta_def(:supports_timestamp_usecs?){false}
+    @offset = sprintf("%+03i%02i", *(Time.now.utc_offset/60).divmod(60))
+  end
+  after do
+    Sequel.default_timezone = nil
+    Sequel.datetime_class = Time
+  end
+  
+  specify "should handle an database timezone of :utc when literalizing values" do
+    Sequel.database_timezone = :utc
+
+    t = Time.now
+    s = t.getutc.strftime("'%Y-%m-%d %H:%M:%S")
+    @dataset.literal(t).should == "#{s}+0000'"
+
+    t = DateTime.now
+    s = t.new_offset(0).strftime("'%Y-%m-%d %H:%M:%S")
+    @dataset.literal(t).should == "#{s}+0000'"
+  end
+  
+  specify "should handle an database timezone of :local when literalizing values" do
+    Sequel.database_timezone = :local
+
+    t = Time.now.utc
+    s = t.getlocal.strftime("'%Y-%m-%d %H:%M:%S")
+    @dataset.literal(t).should == "#{s}#{@offset}'"
+
+    t = DateTime.now.new_offset(0)
+    s = t.new_offset(Sequel::LOCAL_DATETIME_OFFSET).strftime("'%Y-%m-%d %H:%M:%S")
+    @dataset.literal(t).should == "#{s}#{@offset}'"
+  end
+  
+  specify "should handle converting database timestamps into application timestamps" do
+    Sequel.database_timezone = :utc
+    Sequel.application_timezone = :local
+    t = Time.now.utc
+    Sequel.database_to_application_timestamp(t).to_s.should == t.getlocal.to_s
+    Sequel.database_to_application_timestamp(t.to_s).to_s.should == t.getlocal.to_s
+    Sequel.database_to_application_timestamp(t.strftime('%Y-%m-%d %H:%M:%S')).to_s.should == t.getlocal.to_s
+    
+    Sequel.datetime_class = DateTime
+    dt = DateTime.now
+    dt2 = dt.new_offset(0)
+    Sequel.database_to_application_timestamp(dt2).to_s.should == dt.to_s
+    Sequel.database_to_application_timestamp(dt2.to_s).to_s.should == dt.to_s
+    Sequel.database_to_application_timestamp(dt2.strftime('%Y-%m-%d %H:%M:%S')).to_s.should == dt.to_s
+    
+    Sequel.datetime_class = Time
+    Sequel.database_timezone = :local
+    Sequel.application_timezone = :utc
+    Sequel.database_to_application_timestamp(t.getlocal).to_s.should == t.to_s
+    Sequel.database_to_application_timestamp(t.getlocal.to_s).to_s.should == t.to_s
+    Sequel.database_to_application_timestamp(t.getlocal.strftime('%Y-%m-%d %H:%M:%S')).to_s.should == t.to_s
+    
+    Sequel.datetime_class = DateTime
+    Sequel.database_to_application_timestamp(dt).to_s.should == dt2.to_s
+    Sequel.database_to_application_timestamp(dt.to_s).to_s.should == dt2.to_s
+    Sequel.database_to_application_timestamp(dt.strftime('%Y-%m-%d %H:%M:%S')).to_s.should == dt2.to_s
+  end
+  
+  specify "should handle typecasting timestamp columns" do
+    Sequel.typecast_timezone = :utc
+    Sequel.application_timezone = :local
+    t = Time.now.utc
+    @db.typecast_value(:datetime, t).to_s.should == t.getlocal.to_s
+    @db.typecast_value(:datetime, t.to_s).to_s.should == t.getlocal.to_s
+    @db.typecast_value(:datetime, t.strftime('%Y-%m-%d %H:%M:%S')).to_s.should == t.getlocal.to_s
+    
+    Sequel.datetime_class = DateTime
+    dt = DateTime.now
+    dt2 = dt.new_offset(0)
+    @db.typecast_value(:datetime, dt2).to_s.should == dt.to_s
+    @db.typecast_value(:datetime, dt2.to_s).to_s.should == dt.to_s
+    @db.typecast_value(:datetime, dt2.strftime('%Y-%m-%d %H:%M:%S')).to_s.should == dt.to_s
+    
+    Sequel.datetime_class = Time
+    Sequel.typecast_timezone = :local
+    Sequel.application_timezone = :utc
+    @db.typecast_value(:datetime, t.getlocal).to_s.should == t.to_s
+    @db.typecast_value(:datetime, t.getlocal.to_s).to_s.should == t.to_s
+    @db.typecast_value(:datetime, t.getlocal.strftime('%Y-%m-%d %H:%M:%S')).to_s.should == t.to_s
+    
+    Sequel.datetime_class = DateTime
+    @db.typecast_value(:datetime, dt).to_s.should == dt2.to_s
+    @db.typecast_value(:datetime, dt.to_s).to_s.should == dt2.to_s
+    @db.typecast_value(:datetime, dt.strftime('%Y-%m-%d %H:%M:%S')).to_s.should == dt2.to_s
+  end
+  
+  specify "should handle converting database timestamp columns from an array of values" do
+    Sequel.database_timezone = :utc
+    Sequel.application_timezone = :local
+    t = Time.now.utc
+    Sequel.database_to_application_timestamp([t.year, t.mon, t.day, t.hour, t.min, t.sec]).to_s.should == t.getlocal.to_s
+    
+    Sequel.datetime_class = DateTime
+    dt = DateTime.now
+    dt2 = dt.new_offset(0)
+    Sequel.database_to_application_timestamp([dt2.year, dt2.mon, dt2.day, dt2.hour, dt2.min, dt2.sec]).to_s.should == dt.to_s
+    
+    Sequel.datetime_class = Time
+    Sequel.database_timezone = :local
+    Sequel.application_timezone = :utc
+    t = t.getlocal
+    Sequel.database_to_application_timestamp([t.year, t.mon, t.day, t.hour, t.min, t.sec]).to_s.should == t.getutc.to_s
+    
+    Sequel.datetime_class = DateTime
+    Sequel.database_to_application_timestamp([dt.year, dt.mon, dt.day, dt.hour, dt.min, dt.sec]).to_s.should == dt2.to_s
+  end
+  
+  specify "should raise an InvalidValue error when an error occurs while converting a timestamp" do
+    proc{Sequel.database_to_application_timestamp([0, 0, 0, 0, 0, 0])}.should raise_error(Sequel::InvalidValue)
+  end
+  
+  specify "should raise an error when attempting to typecast to a timestamp from an unsupported type" do
+    proc{Sequel.database_to_application_timestamp(Object.new)}.should raise_error(Sequel::InvalidValue)
+  end
+
+  specify "should raise an InvalidValue error when the DateTime class is used and when a bad application timezone is used when attempting to convert timestamps" do
+    Sequel.application_timezone = :blah
+    Sequel.datetime_class = DateTime
+    proc{Sequel.database_to_application_timestamp('2009-06-01 10:20:30')}.should raise_error(Sequel::InvalidValue)
+  end
+  
+  specify "should raise an InvalidValue error when the DateTime class is used and when a bad database timezone is used when attempting to convert timestamps" do
+    Sequel.database_timezone = :blah
+    Sequel.datetime_class = DateTime
+    proc{Sequel.database_to_application_timestamp('2009-06-01 10:20:30')}.should raise_error(Sequel::InvalidValue)
+  end
+
+  specify "should have Sequel.default_timezone= should set all other timezones" do
+    Sequel.database_timezone.should == nil
+    Sequel.application_timezone.should == nil
+    Sequel.typecast_timezone.should == nil
+    Sequel.default_timezone = :utc
+    Sequel.database_timezone.should == :utc
+    Sequel.application_timezone.should == :utc
+    Sequel.typecast_timezone.should == :utc
   end
 end

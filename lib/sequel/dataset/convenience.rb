@@ -25,7 +25,7 @@ module Sequel
 
     # Returns the average value for the given column.
     def avg(column)
-      get{|o| o.avg(column)}
+      aggregate_dataset.get{avg(column)}
     end
     
     # Returns true if no records exist in the dataset, false otherwise
@@ -82,12 +82,20 @@ module Sequel
     end
 
     # Returns a dataset grouped by the given column with count by group,
-    # order by the count of records.  Examples:
+    # order by the count of records (in ascending order). Column aliases
+    # may be supplied, and will be included in the select clause.
     #
-    #   ds.group_and_count(:name) => [{:name=>'a', :count=>1}, ...]
-    #   ds.group_and_count(:first_name, :last_name) => [{:first_name=>'a', :last_name=>'b', :count=>1}, ...]
+    # Examples:
+    #
+    #   ds.group_and_count(:name).all => [{:name=>'a', :count=>1}, ...]
+    #   ds.group_and_count(:first_name, :last_name).all => [{:first_name=>'a', :last_name=>'b', :count=>1}, ...]
+    #   ds.group_and_count(:first_name___name).all => [{:name=>'a', :count=>1}, ...]
     def group_and_count(*columns)
-      group(*columns).select(*(columns + [COUNT_OF_ALL_AS_COUNT])).order(:count)
+      groups = columns.map do |c|
+        c_table, column, _ = split_symbol(c)
+        c_table ? column.to_sym.qualify(c_table) : column.to_sym
+      end
+      group(*groups).select(*(columns + [COUNT_OF_ALL_AS_COUNT])).order(:count)
     end
     
     # Inserts multiple records into the associated table. This method can be
@@ -109,7 +117,7 @@ module Sequel
     #   # this will commit every 50 records
     #   dataset.import([:x, :y], [[1, 2], [3, 4], ...], :slice => 50)
     def import(columns, values, opts={})
-      return @db.transaction{execute_dui("#{insert_sql_base}#{quote_schema_table(@opts[:from].first)} (#{identifier_list(columns)}) VALUES #{literal(values)}")} if values.is_a?(Dataset)
+      return @db.transaction{insert(columns, values)} if values.is_a?(Dataset)
 
       return if values.empty?
       raise(Error, IMPORT_ERROR_MSG) if columns.empty?
@@ -130,7 +138,7 @@ module Sequel
     # Returns the interval between minimum and maximum values for the given 
     # column.
     def interval(column)
-      get{|o| o.max(column) - o.min(column)}
+      aggregate_dataset.get{max(column) - min(column)}
     end
 
     # Reverses the order and then runs first.  Note that this
@@ -159,12 +167,12 @@ module Sequel
 
     # Returns the maximum value for the given column.
     def max(column)
-      get{|o| o.max(column)}
+      aggregate_dataset.get{max(column)}
     end
 
     # Returns the minimum value for the given column.
     def min(column)
-      get{|o| o.min(column)}
+      aggregate_dataset.get{min(column)}
     end
 
     # This is a front end for import that allows you to submit an array of
@@ -186,7 +194,7 @@ module Sequel
     # Returns a Range object made from the minimum and maximum values for the
     # given column.
     def range(column)
-      if r = select{|o| [o.min(column).as(:v1), o.max(column).as(:v2)]}.first
+      if r = aggregate_dataset.select{[min(column).as(v1), max(column).as(v2)]}.first
         (r[:v1]..r[:v2])
       end
     end
@@ -207,7 +215,7 @@ module Sequel
     
     # Returns the sum for the given column.
     def sum(column)
-      get{|o| o.sum(column)}
+      aggregate_dataset.get{sum(column)}
     end
 
     # Returns a string in CSV format containing the dataset records. By 

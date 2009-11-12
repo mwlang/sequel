@@ -1,5 +1,3 @@
-Sequel.require %w'date_format unsupported', 'adapters/utils'
-
 module Sequel
   module JDBC
     # Database and Dataset support for H2 databases accessed via JDBC.
@@ -29,12 +27,23 @@ module Sequel
         def alter_table_sql(table, op)
           case op[:op]
           when :add_column
-            if op.delete(:primary_key)
-              sql = super(table, op)
-              [sql, "ALTER TABLE #{quote_schema_table(table)} ADD PRIMARY KEY (#{quote_identifier(op[:name])})"]
+            if (pk = op.delete(:primary_key)) || (ref = op.delete(:table))
+              sqls = [super(table, op)]
+              sqls << "ALTER TABLE #{quote_schema_table(table)} ADD PRIMARY KEY (#{quote_identifier(op[:name])})" if pk
+              if ref
+                op[:table] = ref
+                sqls << "ALTER TABLE #{quote_schema_table(table)} ADD FOREIGN KEY (#{quote_identifier(op[:name])}) #{column_references_sql(op)}"
+              end
+              sqls
             else
               super(table, op)
             end
+          when :rename_column
+            "ALTER TABLE #{quote_schema_table(table)} ALTER COLUMN #{quote_identifier(op[:name])} RENAME TO #{quote_identifier(op[:new_name])}"
+          when :set_column_null
+            "ALTER TABLE #{quote_schema_table(table)} ALTER COLUMN #{quote_identifier(op[:name])} SET#{' NOT' unless op[:null]} NULL"
+          when :set_column_type
+            "ALTER TABLE #{quote_schema_table(table)} ALTER COLUMN #{quote_identifier(op[:name])} #{type_literal(op)}"
           else
             super(table, op)
           end
@@ -65,8 +74,40 @@ module Sequel
       
       # Dataset class for H2 datasets accessed via JDBC.
       class Dataset < JDBC::Dataset
-        include Dataset::SQLStandardDateFormat
-        include Dataset::UnsupportedIsTrue
+        SELECT_CLAUSE_METHODS = clause_methods(:select, %w'distinct columns from join where group having compounds order limit')
+        
+        # Work around H2's lack of a case insensitive LIKE operator
+        def complex_expression_sql(op, args)
+          case op
+          when :ILIKE
+            super(:LIKE, [SQL::PlaceholderLiteralString.new("CAST(? AS VARCHAR_IGNORECASE)", [args.at(0)]), args.at(1)])
+          when :"NOT ILIKE"
+            super(:"NOT LIKE", [SQL::PlaceholderLiteralString.new("CAST(? AS VARCHAR_IGNORECASE)", [args.at(0)]), args.at(1)])
+          else
+            super(op, args)
+          end
+        end
+        
+        # H2 requires SQL standard datetimes
+        def requires_sql_standard_datetimes?
+          true
+        end
+
+        # H2 doesn't support IS TRUE
+        def supports_is_true?
+          false
+        end
+        
+        # H2 doesn't support JOIN USING
+        def supports_join_using?
+          false
+        end 
+
+        private
+      
+        def select_clause_methods
+          SELECT_CLAUSE_METHODS
+        end
       end
     end
   end

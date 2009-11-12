@@ -44,12 +44,12 @@ context "A PostgreSQL database" do
 
   specify "should correctly parse the schema" do
     @db.schema(:test3, :reload=>true).should == [
-      [:value, {:type=>:integer, :allow_null=>true, :default=>nil, :db_type=>"integer", :primary_key=>false}],
-      [:time, {:type=>:datetime, :allow_null=>true, :default=>nil, :db_type=>"timestamp without time zone", :primary_key=>false}]
+      [:value, {:type=>:integer, :allow_null=>true, :default=>nil, :ruby_default=>nil, :db_type=>"integer", :primary_key=>false}],
+      [:time, {:type=>:datetime, :allow_null=>true, :default=>nil, :ruby_default=>nil, :db_type=>"timestamp without time zone", :primary_key=>false}]
     ]
     @db.schema(:test4, :reload=>true).should == [
-      [:name, {:type=>:string, :allow_null=>true, :default=>nil, :db_type=>"character varying(20)", :primary_key=>false}],
-      [:value, {:type=>:blob, :allow_null=>true, :default=>nil, :db_type=>"bytea", :primary_key=>false}]
+      [:name, {:type=>:string, :allow_null=>true, :default=>nil, :ruby_default=>nil, :db_type=>"character varying(20)", :primary_key=>false}],
+      [:value, {:type=>:blob, :allow_null=>true, :default=>nil, :ruby_default=>nil, :db_type=>"bytea", :primary_key=>false}]
     ]
   end
 end
@@ -129,6 +129,24 @@ context "A PostgreSQL dataset" do
     @d.filter(:name => /bc/).count.should == 2
     @d.filter(:name => /^bc/).count.should == 1
   end
+  
+  specify "should support for_share and for_update" do
+    @d.for_share.all.should == []
+    @d.for_update.all.should == []
+  end
+  
+  specify "#lock should lock tables and yield if a block is given" do
+    @d.lock('EXCLUSIVE'){@d.insert(:name=>'a')}
+  end
+  
+  specify "#lock should lock table if inside a transaction" do
+    POSTGRES_DB.transaction{@d.lock('EXCLUSIVE'); @d.insert(:name=>'a')}
+  end
+  
+  specify "#lock should return nil" do
+    @d.lock('EXCLUSIVE'){@d.insert(:name=>'a')}.should == nil
+    POSTGRES_DB.transaction{@d.lock('EXCLUSIVE').should == nil; @d.insert(:name=>'a')}
+  end
 end
 
 context "A PostgreSQL dataset with a timestamp field" do
@@ -137,11 +155,19 @@ context "A PostgreSQL dataset with a timestamp field" do
     @d.delete
   end
 
-  specify "should store milliseconds in time fields" do
+  cspecify "should store milliseconds in time fields", :do do
     t = Time.now
     @d << {:value=>1, :time=>t}
     @d.literal(@d[:value =>'1'][:time]).should == @d.literal(t)
     @d[:value=>'1'][:time].usec.should == t.usec
+  end
+end
+
+context "PostgreSQL's EXPLAIN and ANALYZE" do
+  specify "should not raise errors" do
+    @d = POSTGRES_DB[:test3]
+    proc{@d.explain}.should_not raise_error
+    proc{@d.analyze}.should_not raise_error
   end
 end
 
@@ -181,6 +207,11 @@ context "A PostgreSQL database" do
     
     @db[:test2].first[:xyz].should == 57
   end
+  
+  specify "#locks should be a dataset returning database locks " do
+    @db.locks.should be_a_kind_of(Sequel::Dataset)
+    @db.locks.all.should be_a_kind_of(Array)
+  end
 end  
 
 context "A PostgreSQL database" do
@@ -209,6 +240,14 @@ context "A PostgreSQL database" do
     @db.reset_primary_key_sequence(:posts).should == nil
   end
   
+  specify "should support opclass specification" do
+    @db.create_table(:posts){text :title; text :body; integer :user_id; index(:user_id, :opclass => :int4_ops, :type => :btree)}
+    @db.sqls.should == [
+    "CREATE TABLE posts (title text, body text, user_id integer)",
+    "CREATE INDEX posts_user_id_index ON posts USING btree (user_id int4_ops)"
+    ]
+  end
+
   specify "should support fulltext indexes and searching" do
     @db.create_table(:posts){text :title; text :body; full_text_index [:title, :body]; full_text_index :title, :language => 'french'}
     @db.sqls.should == [
@@ -269,6 +308,11 @@ context "A PostgreSQL database" do
       "CREATE TABLE posts (title varchar(5))",
       "CREATE INDEX posts_title_index ON posts (title) WHERE (title = '5')"
     ]
+  end
+  
+  specify "should support renaming tables" do
+    @db.create_table!(:posts1){primary_key :a}
+    @db.rename_table(:posts1, :posts)
   end
 end
 
@@ -358,9 +402,8 @@ context "Postgres::Dataset#insert" do
 
   specify "should use INSERT RETURNING if server_version >= 80200" do
     @ds.meta_def(:server_version){80201}
-    @ds.should_receive(:clone).once.with(:server=>:default, :sql=>'INSERT INTO test5 (value) VALUES (10) RETURNING xid').and_return(@ds)
-    @ds.should_receive(:single_value).once
     @ds.insert(:value=>10)
+    @db.sqls.last.should == 'INSERT INTO test5 (value) VALUES (10) RETURNING xid'
   end
 
   specify "should have insert_returning_sql use the RETURNING keyword" do
@@ -373,7 +416,11 @@ context "Postgres::Dataset#insert" do
     @ds.insert_select(:value=>10).should == nil
   end
 
-  specify "should have insert_select insert the record and return the inserted record if server_version < 80200" do
+  specify "should have insert_select return nil if disable_insert_returning is used" do
+    @ds.disable_insert_returning.insert_select(:value=>10).should == nil
+  end
+
+  specify "should have insert_select insert the record and return the inserted record if server_version >= 80200" do
     @ds.meta_def(:server_version){80201}
     h = @ds.insert_select(:value=>10)
     h[:value].should == 10
@@ -516,6 +563,36 @@ if POSTGRES_DB.server_version >= 80300
   end
 end
 
+if POSTGRES_DB.dataset.supports_window_functions?
+  context "Postgres::Dataset named windows" do
+    before do
+      @db = POSTGRES_DB
+      @db.create_table!(:i1){Integer :id; Integer :group_id; Integer :amount}
+      @ds = @db[:i1].order(:id)
+      @ds.insert(:id=>1, :group_id=>1, :amount=>1)
+      @ds.insert(:id=>2, :group_id=>1, :amount=>10)
+      @ds.insert(:id=>3, :group_id=>1, :amount=>100)
+      @ds.insert(:id=>4, :group_id=>2, :amount=>1000)
+      @ds.insert(:id=>5, :group_id=>2, :amount=>10000)
+      @ds.insert(:id=>6, :group_id=>2, :amount=>100000)
+    end
+    after do
+      @db.drop_table(:i1)
+    end
+    
+    specify "should give correct results for window functions" do
+      @ds.window(:win, :partition=>:group_id, :order=>:id).select(:id){sum(:over, :args=>amount, :window=>win){}}.all.should ==
+        [{:sum=>1, :id=>1}, {:sum=>11, :id=>2}, {:sum=>111, :id=>3}, {:sum=>1000, :id=>4}, {:sum=>11000, :id=>5}, {:sum=>111000, :id=>6}]
+      @ds.window(:win, :partition=>:group_id).select(:id){sum(:over, :args=>amount, :window=>win, :order=>id){}}.all.should ==
+        [{:sum=>1, :id=>1}, {:sum=>11, :id=>2}, {:sum=>111, :id=>3}, {:sum=>1000, :id=>4}, {:sum=>11000, :id=>5}, {:sum=>111000, :id=>6}]
+      @ds.window(:win, {}).select(:id){sum(:over, :args=>amount, :window=>:win, :order=>id){}}.all.should ==
+        [{:sum=>1, :id=>1}, {:sum=>11, :id=>2}, {:sum=>111, :id=>3}, {:sum=>1111, :id=>4}, {:sum=>11111, :id=>5}, {:sum=>111111, :id=>6}]
+      @ds.window(:win, :partition=>:group_id).select(:id){sum(:over, :args=>amount, :window=>:win, :order=>id, :frame=>:all){}}.all.should ==
+        [{:sum=>111, :id=>1}, {:sum=>111, :id=>2}, {:sum=>111, :id=>3}, {:sum=>111000, :id=>4}, {:sum=>111000, :id=>5}, {:sum=>111000, :id=>6}]
+    end
+  end
+end
+
 context "Postgres::Database functions, languages, and triggers" do
   before do
     @d = POSTGRES_DB
@@ -584,4 +661,40 @@ context "Postgres::Database functions, languages, and triggers" do
     # Make sure if exists works
     @d.drop_trigger(:test, :identity, :if_exists=>true, :cascade=>true)
   end
+end
+
+if POSTGRES_DB.class.adapter_scheme == :postgres
+context "Postgres::Dataset #use_cursor" do
+  before(:all) do
+    @db = POSTGRES_DB
+    @db.create_table!(:test_cursor){Integer :x}
+    @db.sqls.clear
+    @ds = @db[:test_cursor]
+    @db.transaction{1001.times{|i| @ds.insert(i)}}
+  end
+  after(:all) do
+    @db.drop_table(:test) rescue nil
+  end
+  
+    specify "should return the same results as the non-cursor use" do
+      @ds.all.should == @ds.use_cursor.all
+    end
+    
+    specify "should respect the :rows_per_fetch option" do
+      @db.sqls.clear
+      @ds.use_cursor.all
+      @db.sqls.length.should == 6
+      @db.sqls.clear
+      @ds.use_cursor(:rows_per_fetch=>100).all
+      @db.sqls.length.should == 15
+    end
+    
+    specify "should handle returning inside block" do
+      def @ds.check_return
+        use_cursor.each{|r| return}
+      end
+      @ds.check_return
+      @ds.all.should == @ds.use_cursor.all
+    end
+end
 end

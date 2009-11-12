@@ -1,8 +1,34 @@
 module Sequel
+  if RUBY_VERSION < '1.9.0'
+    # If on Ruby 1.8, create a Sequel::BasicObject class that is similar to the
+    # the Ruby 1.9 BasicObject class.  This is used in a few places where proxy
+    # objects are needed that respond to any method call.
+    class BasicObject
+      (instance_methods - %w"__id__ __send__ instance_eval == equal?").each{|m| undef_method(m)}
+    end
+  else
+    # If on 1.9, create a Sequel::BasicObject class that is just like the
+    # default BasicObject class, except that missing constants are resolved in
+    # Object.  This allows the virtual row support to work with classes
+    # without prefixing them with ::, such as:
+    #
+    #   DB[:bonds].filter{maturity_date > Time.now}
+    class BasicObject < ::BasicObject
+      # Lookup missing constants in ::Object
+      def self.const_missing(name)
+        ::Object.const_get(name)
+      end
+    end
+  end
+
+  class LiteralString < ::String
+  end
+
   # The SQL module holds classes whose instances represent SQL fragments.
   # It also holds modules that are included in core ruby classes that
   # make Sequel a friendly DSL.
   module SQL
+
     ### Parent Classes ###
 
     # Classes/Modules aren't an alphabetical order due to the fact that
@@ -22,6 +48,11 @@ module Sequel
       # LiteralString.
       def lit
         self
+      end
+      
+      # Alias for to_s
+      def sql_literal(ds)
+        to_s(ds)
       end
     end
 
@@ -127,9 +158,7 @@ module Sequel
       ComplexExpression::BITWISE_OPERATORS.each do |o|
         define_method(o) do |ce|
           case ce
-          when NumericExpression 
-            NumericExpression.new(o, self, ce)
-          when ComplexExpression
+          when BooleanExpression, StringExpression
             raise(Sequel::Error, "cannot apply #{o} to a non-numeric expression")
           else  
             NumericExpression.new(o, self, ce)
@@ -157,9 +186,7 @@ module Sequel
       ComplexExpression::BOOLEAN_OPERATOR_METHODS.each do |m, o|
         define_method(m) do |ce|
           case ce
-          when BooleanExpression
-            BooleanExpression.new(o, self, ce)
-          when ComplexExpression
+          when NumericExpression, StringExpression
             raise(Sequel::Error, "cannot apply #{o} to a non-boolean expression")
           else  
             BooleanExpression.new(o, self, ce)
@@ -286,9 +313,7 @@ module Sequel
       ComplexExpression::MATHEMATICAL_OPERATORS.each do |o|
         define_method(o) do |ce|
           case ce
-          when NumericExpression
-            NumericExpression.new(o, self, ce)
-          when ComplexExpression
+          when BooleanExpression, StringExpression
             raise(Sequel::Error, "cannot apply #{o} to a non-numeric expression")
           else  
             NumericExpression.new(o, self, ce)
@@ -360,25 +385,6 @@ module Sequel
       def sql_subscript(*sub)
         Subscript.new(self, sub.flatten)
       end
-    end
-
-    class ComplexExpression
-      include AliasMethods
-      include CastMethods
-      include OrderMethods
-      include SubscriptMethods
-    end
-
-    class GenericExpression
-      include AliasMethods
-      include CastMethods
-      include OrderMethods
-      include ComplexExpressionMethods
-      include BooleanMethods
-      include NumericMethods
-      include StringMethods
-      include SubscriptMethods
-      include InequalityMethods
     end
 
     ### Classes ###
@@ -465,8 +471,8 @@ module Sequel
           else
             BooleanExpression.new(OPERTATOR_INVERSIONS[op], *ce.args.dup)
           end
-        when ComplexExpression
-          raise(Sequel::Error, "operator #{ce.op} cannot be inverted")
+        when StringExpression, NumericExpression
+          raise(Sequel::Error, "cannot invert #{ce.inspect}")
         else
           BooleanExpression.new(:NOT, ce)
         end
@@ -530,6 +536,33 @@ module Sequel
 
       to_s_method :column_all_sql
     end
+    
+    class ComplexExpression
+      include AliasMethods
+      include CastMethods
+      include OrderMethods
+      include SubscriptMethods
+    end
+
+    # Represents constants or psuedo-constants (e.g. CURRENT_DATE) in SQL
+    class Constant < GenericExpression
+      # Create an object with the given table
+      def initialize(constant)
+        @constant = constant
+      end
+      
+      to_s_method :constant_sql, '@constant'
+    end
+    
+    # Holds default generic constants that can be referenced.  These
+    # are included in the Sequel top level module and are also available
+    # in this module which can be required at the top level to get
+    # direct access to the constants.
+    module Constants
+      CURRENT_DATE = Constant.new(:CURRENT_DATE)
+      CURRENT_TIME = Constant.new(:CURRENT_TIME)
+      CURRENT_TIMESTAMP = Constant.new(:CURRENT_TIMESTAMP)
+    end
 
     # Represents an SQL function call.
     class Function < GenericExpression
@@ -553,6 +586,18 @@ module Sequel
       to_s_method :function_sql
     end
     
+    class GenericExpression
+      include AliasMethods
+      include BooleanMethods
+      include CastMethods
+      include ComplexExpressionMethods
+      include InequalityMethods
+      include NumericMethods
+      include OrderMethods
+      include StringMethods
+      include SubscriptMethods
+    end
+
     # Represents an identifier (column or table). Can be used
     # to specify a Symbol with multiple underscores should not be
     # split, or for creating an identifier without using a symbol.
@@ -625,6 +670,9 @@ module Sequel
     # required for the prepared statement support
     class PlaceholderLiteralString < Expression
       # The arguments that will be subsituted into the placeholders.
+      # Either an array of unnamed placeholders (which will be substituted in
+      # order for ? characters), or a hash of named placeholders (which will be
+      # substituted for :key phrases).
       attr_reader :args
 
       # The literal string containing placeholders
@@ -636,7 +684,7 @@ module Sequel
       # Create an object with the given string, placeholder arguments, and parens flag.
       def initialize(str, args, parens=false)
         @str = str
-        @args = args
+        @args = args.is_a?(Array) && args.length == 1 && (v = args.at(0)).is_a?(Hash) ? v : args
         @parens = parens
       end
 
@@ -663,6 +711,21 @@ module Sequel
       # Set the expression and descending attributes to the given values.
       def initialize(expression, descending = true)
         @expression, @descending = expression, descending
+      end
+
+      # Return a copy that is ASC
+      def asc
+        OrderedExpression.new(@expression, false)
+      end
+
+      # Return a copy that is DESC
+      def desc
+        OrderedExpression.new(@expression)
+      end
+
+      # Return an inverted expression, changing ASC to DESC and vice versa
+      def invert
+        OrderedExpression.new(@expression, !@descending)
       end
 
       to_s_method :ordered_expression_sql
@@ -741,6 +804,7 @@ module Sequel
     class SQLArray < Expression
       # The array of objects this SQLArray wraps
       attr_reader :array
+      alias to_a array
 
       # Create an object with the given array.
       def initialize(array)
@@ -772,52 +836,129 @@ module Sequel
       to_s_method :subscript_sql
     end
 
-    if RUBY_VERSION >= '1.9.0'
-      class VirtualRow < BasicObject
-      end
-    else
-      class VirtualRow
-        (instance_methods - %w"__id__ __send__ instance_eval == equal?").each{|m| undef_method(m)}
-      end
-    end
-
     # The purpose of this class is to allow the easy creation of SQL identifiers and functions
     # without relying on methods defined on Symbol.  This is useful if another library defines
     # the methods defined by Sequel, or if you are running on ruby 1.9.
     #
     # An instance of this class is yielded to the block supplied to filter, order, and select.
-    # If Sequel.virtual_row_instance_eval is true and the block doesn't take an argument,
-    # the block is instance_evaled in the context of a new instance of this class.
+    # If the block doesn't take an argument, the block is instance_evaled in the context of
+    # a new instance of this class.
+    #
+    # VirtualRow uses method_missing to return Identifiers, QualifiedIdentifiers, Functions, or WindowFunctions, 
+    # depending on how it is called.  If a block is not given, creates one of the following objects:
+    # * Function - returned if any arguments are supplied, using the method name
+    #   as the function name, and the arguments as the function arguments.
+    # * QualifiedIdentifier - returned if the method name contains __, with the
+    #   table being the part before __, and the column being the part after.
+    # * Identifier - returned otherwise, using the method name.
+    # If a block is given, it returns either a Function or WindowFunction, depending on the first
+    # argument to the method.  Note that the block is currently not called by the code, though
+    # this may change in a future version.  If the first argument is:
+    # * no arguments given - uses a Function with no arguments.
+    # * :* - uses a Function with a literal wildcard argument (*), mostly useful for COUNT.
+    # * :distinct - uses a Function that prepends DISTINCT to the rest of the arguments, mostly
+    #   useful for aggregate functions.
+    # * :over - uses a WindowFunction.  If a second argument is provided, it should be a hash
+    #   of options which are passed to Window (e.g. :window, :partition, :order, :frame).  The
+    #   arguments to the function itself should be specified as :*=>true for a wildcard, or via
+    #   the :args option.
     #
     # Examples:
     #
     #   ds = DB[:t]
+    #   # Argument yielded to block
     #   ds.filter{|r| r.name < 2} # SELECT * FROM t WHERE (name < 2)
-    #   ds.filter{|r| r.table__column + 1 < 2} # SELECT * FROM t WHERE ((table.column + 1) < 2)
-    #   ds.filter{|r| r.is_active(1, 'arg2')} # SELECT * FROM t WHERE is_active(1, 'arg2')
-    class VirtualRow
-      # Can return Identifiers, QualifiedIdentifiers, or Functions:
-      #
-      # * Function - returned if any arguments are supplied, using the method name
-      #   as the function name, and the arguments as the function arguments.
-      # * QualifiedIdentifier - returned if the method name contains __, with the
-      #   table being the part before __, and the column being the part after.
-      # * Identifier - returned otherwise, using the method name.
-      def method_missing(m, *args)
-        if args.empty?
-          table, column = m.to_s.split('__', 2)
+    #   # Block without argument (instance_eval)
+    #   ds.filter{name < 2} # SELECT * FROM t WHERE (name < 2)
+    #   # Qualified identifiers
+    #   ds.filter{table__column + 1 < 2} # SELECT * FROM t WHERE ((table.column + 1) < 2)
+    #   # Functions
+    #   ds.filter{is_active(1, 'arg2')} # SELECT * FROM t WHERE is_active(1, 'arg2')
+    #   ds.select{version{}} # SELECT version() FROM t
+    #   ds.select{count(:*){}} # SELECT count(*) FROM t
+    #   ds.select{count(:distinct, col1){}} # SELECT count(DISTINCT col1) FROM t
+    #   # Window Functions
+    #   ds.select{rank(:over){}} # SELECT rank() OVER () FROM t
+    #   ds.select{count(:over, :*=>true){}} # SELECT count(*) OVER () FROM t
+    #   ds.select{sum(:over, :args=>col1, :partition=>col2, :order=>col3){}} # SELECT sum(col1) OVER (PARTITION BY col2 ORDER BY col3) FROM t
+    class VirtualRow < BasicObject
+      WILDCARD = LiteralString.new('*').freeze
+      QUESTION_MARK = LiteralString.new('?').freeze
+      COMMA_SEPARATOR = LiteralString.new(', ').freeze
+      DOUBLE_UNDERSCORE = '__'.freeze
+
+      # Return Identifiers, QualifiedIdentifiers, Functions, or WindowFunctions, depending
+      # on arguments and whether a block is provided.  Does not currently call the block.
+      # See the class level documentation.
+      def method_missing(m, *args, &block)
+        if block
+          if args.empty?
+            Function.new(m)
+          else
+            case arg = args.shift
+            when :*
+              Function.new(m, WILDCARD)
+            when :distinct
+              Function.new(m, PlaceholderLiteralString.new("DISTINCT #{args.map{QUESTION_MARK}.join(COMMA_SEPARATOR)}", args))
+            when :over
+              opts = args.shift || {}
+              fun_args = ::Kernel.Array(opts[:*] ? WILDCARD : opts[:args])
+              WindowFunction.new(Function.new(m, *fun_args), Window.new(opts))
+            else
+              raise Error, 'unsupported VirtualRow method argument used with block'
+            end
+          end
+        elsif args.empty?
+          table, column = m.to_s.split(DOUBLE_UNDERSCORE, 2)
           column ? QualifiedIdentifier.new(table, column) : Identifier.new(m)
         else
           Function.new(m, *args)
         end
       end
     end
+
+    # A window is part of a window function specifying the window over which the function operates.
+    # It is separated from the WindowFunction class because it also can be used separately on
+    # some databases.
+    class Window < Expression
+      # The options for this window.  Options currently used are:
+      # * :frame - if specified, should be :all or :rows.  :all always operates over all rows in the
+      #   partition, while :rows excludes the current row's later peers.  The default is to include
+      #   all previous rows in the partition up to the current row's last peer.
+      # * :order - order on the column(s) given
+      # * :partition - partition/group on the column(s) given
+      # * :window - base results on a previously specified named window
+      attr_reader :opts
+
+      # Set the options to the options given
+      def initialize(opts={})
+        @opts = opts
+      end
+
+      to_s_method :window_sql, '@opts'
+    end
+
+    # A WindowFunction is a grouping of a function with a window over which it operates.
+    class WindowFunction < GenericExpression
+      # The function to use, should be an SQL::Function.
+      attr_reader :function
+
+      # The window to use, should be an SQL::Window.
+      attr_reader :window
+
+      # Set the function and window.
+      def initialize(function, window)
+        @function, @window = function, window
+      end
+
+      to_s_method :window_function_sql, '@function, @window'
+    end
   end
 
   # LiteralString is used to represent literal SQL expressions. A 
   # LiteralString is copied verbatim into an SQL statement. Instances of
   # LiteralString can be created by calling String#lit.
-  class LiteralString < ::String
+  class LiteralString
     include SQL::OrderMethods
     include SQL::ComplexExpressionMethods
     include SQL::BooleanMethods
@@ -825,4 +966,6 @@ module Sequel
     include SQL::StringMethods
     include SQL::InequalityMethods
   end
+  
+  include SQL::Constants
 end

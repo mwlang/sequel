@@ -32,10 +32,10 @@ module Sequel
         db.busy_timeout(opts.fetch(:timeout, 5000))
         db.type_translation = true
         
-        # Handle datetime's with Sequel.datetime_class
+        # Handle datetimes with Sequel.datetime_class
         prok = proc do |t,v|
           v = Time.at(v.to_i).iso8601 if UNIX_EPOCH_TIME_FORMAT.match(v)
-          Sequel.string_to_datetime(v)
+          Sequel.database_to_application_timestamp(v)
         end
         db.translator.add_translator("timestamp", &prok)
         db.translator.add_translator("datetime", &prok)
@@ -122,7 +122,6 @@ module Sequel
     class Dataset < Sequel::Dataset
       include ::Sequel::SQLite::DatasetMethods
       
-      EXPLAIN = 'EXPLAIN %s'.freeze
       PREPARED_ARG_PLACEHOLDER = ':'.freeze
       
       # SQLite already supports named bind arguments, so use directly.
@@ -172,20 +171,6 @@ module Sequel
         end
       end
       
-      # Prepare an unnamed statement of the given type and call it with the
-      # given values.
-      def call(type, hash, values=nil, &block)
-        prepare(type, nil, values).call(hash, &block)
-      end
-      
-      # Return an array of strings specifying a query explanation for the
-      # current dataset.
-      def explain
-        res = []
-        @db.result_set(EXPLAIN % select_sql(opts), nil) {|r| res << r}
-        res
-      end
-      
       # Yield a hash for each row in the dataset.
       def fetch_rows(sql)
         execute(sql) do |result|
@@ -203,7 +188,7 @@ module Sequel
       # Prepare the given type of query with the given name and store
       # it in the database.  Note that a new native prepared statement is
       # created on each call to this prepared statement.
-      def prepare(type, name=nil, values=nil)
+      def prepare(type, name=nil, *values)
         ps = to_prepared_statement(type, values)
         ps.extend(PreparedStatementMethods)
         db.prepared_statements[name] = ps if name

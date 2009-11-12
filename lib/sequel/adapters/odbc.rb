@@ -12,8 +12,8 @@ module Sequel
         super(opts)
         case opts[:db_type]
         when 'mssql'
-          Sequel.require 'adapters/shared/mssql'
-          extend Sequel::MSSQL::DatabaseMethods
+          Sequel.require 'adapters/odbc/mssql'
+          extend Sequel::ODBC::MSSQL::DatabaseMethods
         when 'progress'
           Sequel.require 'adapters/shared/progress'
           extend Sequel::Progress::DatabaseMethods
@@ -44,26 +44,38 @@ module Sequel
         ODBC::Dataset.new(self, opts)
       end
     
-      # ODBC returns native statement objects, which must be dropped if
-      # you call execute manually, or you will get warnings.  See the
-      # fetch_rows method source code for an example of how to drop
-      # the statements.
       def execute(sql, opts={})
         log_info(sql)
         synchronize(opts[:server]) do |conn|
-          r = conn.run(sql)
-          yield(r) if block_given?
-          r
+          begin
+            r = conn.run(sql)
+            yield(r) if block_given?
+          rescue ::ODBC::Error => e
+            raise_error(e)
+          ensure
+            r.drop if r
+          end
+          nil
         end
       end
       
       def execute_dui(sql, opts={})
         log_info(sql)
-        synchronize(opts[:server]){|conn| conn.do(sql)}
+        synchronize(opts[:server]) do |conn|
+          begin
+            conn.do(sql)
+          rescue ::ODBC::Error => e
+            raise_error(e)
+          end
+        end
       end
-      alias_method :do, :execute_dui
+      alias do execute_dui
 
       private
+      
+      def connection_pool_default_options
+        super.merge(:pool_convert_exceptions=>false)
+      end
       
       def connection_execute_method
         :do
@@ -77,26 +89,20 @@ module Sequel
     class Dataset < Sequel::Dataset
       BOOL_TRUE = '1'.freeze
       BOOL_FALSE = '0'.freeze
-      ODBC_TIMESTAMP_FORMAT = "{ts '%Y-%m-%d %H:%M:%S'}".freeze
-      ODBC_TIMESTAMP_AFTER_SECONDS =
-        ODBC_TIMESTAMP_FORMAT.index( '%S' ).succ - ODBC_TIMESTAMP_FORMAT.length
       ODBC_DATE_FORMAT = "{d '%Y-%m-%d'}".freeze
-      UNTITLED_COLUMN = 'untitled_%d'.freeze
+      TIMESTAMP_FORMAT="{ts '%Y-%m-%d %H:%M:%S'}".freeze
 
       def fetch_rows(sql, &block)
         execute(sql) do |s|
-          begin
-            untitled_count = 0
-            @columns = s.columns(true).map do |c|
-              if (n = c.name).empty?
-                n = UNTITLED_COLUMN % (untitled_count += 1)
-              end
-              output_identifier(n)
+          i = -1
+          cols = s.columns(true).map{|c| [output_identifier(c.name), i+=1]}
+          @columns = cols.map{|c| c.at(0)}
+          if rows = s.fetch_all
+            rows.each do |row|
+              hash = {}
+              cols.each{|n,i| hash[n] = convert_odbc_value(row[i])}
+              yield hash
             end
-            rows = s.fetch_all
-            rows.each {|row| yield hash_row(row)} if rows
-          ensure
-            s.drop unless s.nil? rescue nil
           end
         end
         self
@@ -113,10 +119,9 @@ module Sequel
         # ODBCColumn#mapSqlTypeToGenericType and Column#klass.
         case v
         when ::ODBC::TimeStamp
-          DateTime.new(v.year, v.month, v.day, v.hour, v.minute, v.second)
+          Sequel.database_to_application_timestamp([v.year, v.month, v.day, v.hour, v.minute, v.second])
         when ::ODBC::Time
-          now = DateTime.now
-          Time.gm(now.year, now.month, now.day, v.hour, v.minute, v.second)
+          Sequel.database_to_application_timestamp([now.year, now.month, now.day, v.hour, v.minute, v.second])
         when ::ODBC::Date
           Date.new(v.year, v.month, v.day)
         else
@@ -124,23 +129,12 @@ module Sequel
         end
       end
       
-      def hash_row(row)
-        hash = {}
-        row.each_with_index do |v, idx|
-          hash[@columns[idx]] = convert_odbc_value(v)
-        end
-        hash
+      def default_timestamp_format
+        TIMESTAMP_FORMAT
       end
-      
+
       def literal_date(v)
         v.strftime(ODBC_DATE_FORMAT)
-      end
-      
-      def literal_datetime(v)
-        formatted = v.strftime(ODBC_TIMESTAMP_FORMAT)
-        usec = v.sec_fraction * 86400000000
-        formatted.insert(ODBC_TIMESTAMP_AFTER_SECONDS, ".#{(usec.to_f/1000).round}") if usec >= 1000
-        formatted
       end
       
       def literal_false
@@ -149,12 +143,6 @@ module Sequel
       
       def literal_true
         BOOL_TRUE
-      end
-
-      def literal_time(v)
-        formatted = v.strftime(ODBC_TIMESTAMP_FORMAT)
-        formatted.insert(ODBC_TIMESTAMP_AFTER_SECONDS, ".#{(v.usec.to_f/1000).round}") if usec >= 1000
-        formatted
       end
     end
   end

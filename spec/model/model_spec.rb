@@ -1,5 +1,37 @@
 require File.join(File.dirname(__FILE__), "spec_helper")
 
+describe "Sequel::Model()" do
+  before do
+    @db = Sequel::Model.db
+  end
+
+  it "should return a model subclass with the given dataset if given a dataset" do
+    ds = @db[:blah]
+    c = Sequel::Model(ds)
+    c.superclass.should == Sequel::Model
+    c.dataset.should == ds
+  end
+
+  it "should return a model subclass with a dataset with the default database and given table name if given a symbol" do
+    c = Sequel::Model(:blah)
+    c.superclass.should == Sequel::Model
+    c.db.should == @db
+    c.table_name.should == :blah
+  end
+
+  it "should return a model subclass associated to the given database if given a database" do
+    db = Sequel::Database.new
+    c = Sequel::Model(db)
+    c.superclass.should == Sequel::Model
+    c.db.should == db
+    proc{c.dataset}.should raise_error(Sequel::Error)
+    class SmBlahTest < c
+    end
+    SmBlahTest.db.should == db
+    SmBlahTest.table_name.should == :sm_blah_tests
+  end
+end
+
 describe Sequel::Model do
   it "should have class method aliased as model" do
     Sequel::Model.instance_methods.collect{|x| x.to_s}.should include("model")
@@ -53,6 +85,11 @@ describe Sequel::Model, "dataset & schema" do
     @model.table_name.should == :foo
   end
 
+  it "table_name should respect table aliases" do
+    @model.set_dataset(:foo___x)
+    @model.table_name.should == :x
+  end
+  
   it "set_dataset should raise an error unless given a Symbol or Dataset" do
     proc{@model.set_dataset(Object.new)}.should raise_error(Sequel::Error)
   end
@@ -62,6 +99,16 @@ describe Sequel::Model, "dataset & schema" do
     ds.should_not respond_to(:destroy)
     @model.set_dataset(ds)
     ds.should respond_to(:destroy)
+  end
+
+  it "should raise an error on set_dataset if there is an error connecting to the database" do
+    @model.meta_def(:columns){raise Sequel::DatabaseConnectionError}
+    proc{@model.set_dataset(MODEL_DB[:foo].join(:blah))}.should raise_error
+  end
+
+  it "should not raise an error if there is a problem getting the columns for a dataset" do
+    @model.meta_def(:columns){raise Sequel::Error}
+    proc{@model.set_dataset(MODEL_DB[:foo].join(:blah))}.should_not raise_error
   end
 
   it "doesn't raise an error on set_dataset if there is an error raised getting the schema" do
@@ -397,8 +444,15 @@ describe Sequel::Model, ".[]" do
     $sqls.last.should == "SELECT * FROM items WHERE (name = 'sharon') LIMIT 1"
   end
 
-  it "should work correctly for composite primary key" do
+  it "should work correctly for composite primary key specified as array" do
     @c.set_primary_key [:node_id, :kind]
+    @c[3921, 201].should be_a_kind_of(@c)
+    $sqls.last.should =~ \
+    /^SELECT \* FROM items WHERE \((\(node_id = 3921\) AND \(kind = 201\))|(\(kind = 201\) AND \(node_id = 3921\))\) LIMIT 1$/
+  end
+  
+  it "should work correctly for composite primary key specified as separate arguments" do
+    @c.set_primary_key :node_id, :kind
     @c[3921, 201].should be_a_kind_of(@c)
     $sqls.last.should =~ \
     /^SELECT \* FROM items WHERE \((\(node_id = 3921\) AND \(kind = 201\))|(\(kind = 201\) AND \(node_id = 3921\))\) LIMIT 1$/
@@ -449,25 +503,65 @@ context "Model.db_schema" do
     @c.db_schema.should == {:x=>{:type=>:integer}, :z=>{}}
   end
 
-  specify "should not use schema_for_table if the dataset uses multiple tables or custom sql" do
+  specify "should not use schema if the dataset uses multiple tables or custom sql" do
     ds = @dataset.join(:x, :id)
     d = ds.db
     e = false
-    d.meta_def(:schema){|table| e = true}
+    d.meta_def(:schema){|table, *opts| e = true}
     def @c.columns; [:x]; end
     @c.dataset = ds
     @c.db_schema.should == {:x=>{}}
     e.should == false
   end
 
-  specify "should fallback to fetching records if schema_for_table raises an error" do
+  specify "should fallback to fetching records if schema raises an error" do
     ds = @dataset.join(:x, :id)
     d = ds.db
-    def d.schema(table)
+    def d.schema(table, opts={})
       raise StandardError
     end
     def @c.columns; [:x]; end
     @c.dataset = ds
     @c.db_schema.should == {:x=>{}}
+  end
+  
+  specify "should automatically set a singular primary key based on the schema" do
+    ds = @dataset
+    d = ds.db
+    d.meta_def(:schema){|table, *opts| [[:x, {:primary_key=>true}]]}
+    @c.primary_key.should == :id
+    @c.dataset = ds
+    @c.db_schema.should == {:x=>{:primary_key=>true}}
+    @c.primary_key.should == :x
+  end
+  
+  specify "should automatically set the composite primary key based on the schema" do
+    ds = @dataset
+    d = ds.db
+    d.meta_def(:schema){|table, *opts| [[:x, {:primary_key=>true}], [:y, {:primary_key=>true}]]}
+    @c.primary_key.should == :id
+    @c.dataset = ds
+    @c.db_schema.should == {:x=>{:primary_key=>true}, :y=>{:primary_key=>true}}
+    @c.primary_key.should == [:x, :y]
+  end
+  
+  specify "should automatically set no primary key based on the schema" do
+    ds = @dataset
+    d = ds.db
+    d.meta_def(:schema){|table, *opts| [[:x, {:primary_key=>false}], [:y, {:primary_key=>false}]]}
+    @c.primary_key.should == :id
+    @c.dataset = ds
+    @c.db_schema.should == {:x=>{:primary_key=>false}, :y=>{:primary_key=>false}}
+    @c.primary_key.should == nil
+  end
+  
+  specify "should not modify the primary key unless all column schema hashes have a :primary_key entry" do
+    ds = @dataset
+    d = ds.db
+    d.meta_def(:schema){|table, *opts| [[:x, {:primary_key=>false}], [:y, {}]]}
+    @c.primary_key.should == :id
+    @c.dataset = ds
+    @c.db_schema.should == {:x=>{:primary_key=>false}, :y=>{}}
+    @c.primary_key.should == :id
   end
 end

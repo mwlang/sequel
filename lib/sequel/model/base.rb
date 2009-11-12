@@ -173,6 +173,7 @@ module Sequel
       # is created.  Also, make sure the inherited class instance variables
       # are copied into the subclass.
       def inherited(subclass)
+        super
         ivs = subclass.instance_variables.collect{|x| x.to_s}
         EMPTY_INSTANCE_VARIABLES.each{|iv| subclass.instance_variable_set(iv, nil) unless ivs.include?(iv.to_s)}
         INHERITED_INSTANCE_VARIABLES.each do |iv, dup|
@@ -184,10 +185,10 @@ module Sequel
         unless ivs.include?("@dataset")
           db
           begin
-            if self == Model
+            if self == Model || !@dataset
               subclass.set_dataset(subclass.implicit_table_name) unless subclass.name.empty?
-            elsif ds = instance_variable_get(:@dataset)
-              subclass.set_dataset(ds.clone, :inherited=>true)
+            elsif @dataset
+              subclass.set_dataset(@dataset.clone, :inherited=>true)
             end
           rescue
             nil
@@ -260,6 +261,7 @@ module Sequel
       # If a dataset is used, the model's database is changed to the given
       # dataset.  If a symbol is used, a dataset is created from the current
       # database with the table name given. Other arguments raise an Error.
+      # Returns self.
       #
       # This changes the row_proc of the given dataset to return
       # model objects, extends the dataset with the dataset_method_modules,
@@ -288,7 +290,13 @@ module Sequel
           @dataset_methods.each{|meth, block| @dataset.meta_def(meth, &block)} if @dataset_methods
         end
         @dataset.model = self if @dataset.respond_to?(:model=)
-        @db_schema = (inherited ? superclass.db_schema : get_db_schema) rescue nil
+        begin
+          @db_schema = (inherited ? superclass.db_schema : get_db_schema)
+        rescue Sequel::DatabaseConnectionError
+          raise
+        rescue
+          nil
+        end
         self
       end
       alias dataset= set_dataset
@@ -310,8 +318,9 @@ module Sequel
       # You can set it to nil to not have a primary key, but that
       # cause certain things not to work, see no_primary_key.
       def set_primary_key(*key)
+        key = key.flatten
         @simple_pk = key.length == 1 ? db.literal(key.first) : nil 
-        @primary_key = (key.length == 1) ? key[0] : key.flatten
+        @primary_key = (key.length == 1) ? key[0] : key
       end
   
       # Set the columns to restrict in new/set/update.  Using this means that
@@ -349,7 +358,7 @@ module Sequel
       
       # Returns name of primary table for the dataset.
       def table_name
-        dataset.opts[:from].first
+        dataset.first_source_alias
       end
   
       # Allow the setting of the primary key(s) inside new/set/update.
@@ -390,7 +399,15 @@ module Sequel
         ds_opts = dataset.opts
         single_table = ds_opts[:from] && (ds_opts[:from].length == 1) \
           && !ds_opts.include?(:join) && !ds_opts.include?(:sql)
-        get_columns = proc{columns rescue []}
+        get_columns = proc do
+          begin
+            columns
+          rescue Sequel::DatabaseConnectionError
+            raise
+          rescue
+            []
+          end
+        end
         if single_table && (schema_array = (db.schema(table_name, :reload=>reload) rescue nil))
           schema_array.each{|k,v| schema_hash[k] = v}
           if ds_opts.include?(:select)
@@ -405,9 +422,12 @@ module Sequel
             # returned by the schema.
             cols = schema_array.collect{|k,v| k}
             set_columns(cols)
-            # Set the primary key(s) based on the schema information
-            pks = schema_array.collect{|k,v| k if v[:primary_key]}.compact
-            pks.length > 0 ? set_primary_key(*pks) : no_primary_key
+            # Set the primary key(s) based on the schema information,
+            # if the schema information includes primary key information
+            if schema_array.all?{|k,v| v.has_key?(:primary_key)}
+              pks = schema_array.collect{|k,v| k if v[:primary_key]}.compact
+              pks.length > 0 ? set_primary_key(*pks) : no_primary_key
+            end
             # Also set the columns for the dataset, so the dataset
             # doesn't have to do a query to get them.
             dataset.instance_variable_set(:@columns, cols)
@@ -471,7 +491,7 @@ module Sequel
       # same name, caching the result in an instance variable.  Define
       # standard attr_writer method for modifying that instance variable
       def self.class_attr_overridable(*meths) # :nodoc:
-        meths.each{|meth| class_eval("def #{meth}; !defined?(@#{meth}) ? (@#{meth} = self.class.#{meth}) : @#{meth} end")}
+        meths.each{|meth| class_eval("def #{meth}; !defined?(@#{meth}) ? (@#{meth} = self.class.#{meth}) : @#{meth} end", __FILE__, __LINE__)}
         attr_writer(*meths) 
       end 
     
@@ -480,7 +500,7 @@ module Sequel
       #   
       #   define_method(meth){self.class.send(meth)}
       def self.class_attr_reader(*meths) # :nodoc:
-        meths.each{|meth| class_eval("def #{meth}; model.#{meth} end")}
+        meths.each{|meth| class_eval("def #{meth}; model.#{meth} end", __FILE__, __LINE__)}
       end
 
       private_class_method :class_attr_overridable, :class_attr_reader
@@ -505,10 +525,11 @@ module Sequel
       def initialize(values = {}, from_db = false)
         if from_db
           @new = false
-          @values = values
+          set_values(values)
         else
           @values = {}
           @new = true
+          @modified = true
           set(values)
           changed_columns.clear 
           yield self if block_given?
@@ -521,21 +542,19 @@ module Sequel
         @values[column]
       end
   
-      # Sets value of the column's attribute and marks the column as changed.
-      # If the column already has the same value, this is a no-op. Note that
-      # changing a columns value and then changing it back will cause the
-      # column to appear in changed_columns.  Similarly, providing a
-      # value that is different from the column's current value but is the
-      # same after typecasting will also cause changed_columns to include the
-      # column.
+      # Sets the value for the given column.  If typecasting is enabled for
+      # this object, typecast the value based on the column's type.
+      # If this a a new record or the typecasted value isn't the same
+      # as the current value for the column, mark the column as changed.
       def []=(column, value)
         # If it is new, it doesn't have a value yet, so we should
         # definitely set the new value.
         # If the column isn't in @values, we can't assume it is
         # NULL in the database, so assume it has changed.
-        if new? || !@values.include?(column) || value != @values[column]
+        v = typecast_value(column, value)
+        if new? || !@values.include?(column) || v != @values[column]
           changed_columns << column unless changed_columns.include?(column)
-          @values[column] = typecast_value(column, value)
+          @values[column] = v
         end
       end
   
@@ -562,6 +581,13 @@ module Sequel
       # or nil (many_to_one), or the array of associated objects (*_to_many).
       def associations
         @associations ||= {}
+      end
+
+      # The autoincrementing primary key for this model object. Should be
+      # overridden if you have a composite primary key with one part of it
+      # being autoincrementing.
+      def autoincrementing_primary_key
+        primary_key
       end
   
       # The columns that have been updated.  This isn't completely accurate,
@@ -628,6 +654,25 @@ module Sequel
       def keys
         @values.keys
       end
+      
+      # Remove elements of the model object that make marshalling fail. Returns self.
+      def marshallable!
+        @this = nil
+        self
+      end
+
+      # Explicitly mark the object as modified, so save_changes/update will
+      # run callbacks even if no columns have changed.
+      def modified!
+        @modified = true
+      end
+
+      # Whether this object has been modified since last saved, used by
+      # save_changes to determine whether changes should be saved.  New
+      # values are always considered modified.
+      def modified?
+        @modified || !changed_columns.empty?
+      end
   
       # Returns true if the current instance represents a new record.
       def new?
@@ -681,11 +726,11 @@ module Sequel
         use_transaction ? db.transaction(opts){_save(columns, opts)} : _save(columns, opts)
       end
 
-      # Saves only changed columns or does nothing if no columns are marked as 
-      # chanaged.  If no columns have been changed, returns nil.  If unable to
+      # Saves only changed columns if the object has been modified.
+      # If the object has not been modified, returns nil.  If unable to
       # save, returns false unless raise_on_save_failure is true.
-      def save_changes
-        save(:changed=>true) || false unless changed_columns.empty?
+      def save_changes(opts={})
+        save(opts.merge(:changed=>true)) || false if modified? 
       end
   
       # Updates the instance with the supplied values with support for virtual
@@ -719,7 +764,7 @@ module Sequel
         @this ||= model.dataset.filter(pk_hash).limit(1).naked
       end
       
-      # Runs set with the passed hash and runs save_changes (which runs any callback methods).
+      # Runs set with the passed hash and then runs save_changes.
       def update(hash)
         update_restricted(hash, nil, nil)
       end
@@ -771,10 +816,26 @@ module Sequel
         self
       end
       
+      def _insert
+        ds = model.dataset
+        if ds.respond_to?(:insert_select) and h = ds.insert_select(@values)
+          @values = h
+          nil
+        else
+          iid = ds.insert(@values)
+          # if we have a regular primary key and it's not set in @values,
+          # we assume it's the last inserted id
+          if (pk = autoincrementing_primary_key) && pk.is_a?(Symbol) && !@values[pk]
+            @values[pk] = iid
+          end
+          pk
+        end
+      end
+      
       # Refresh using a particular dataset, used inside save to make sure the same server
       # is used for reading newly inserted values from the database
       def _refresh(dataset)
-        @values = dataset.first || raise(Error, "Record not found")
+        set_values(dataset.first || raise(Error, "Record not found"))
         changed_columns.clear
         associations.clear
         self
@@ -786,19 +847,8 @@ module Sequel
         return save_failure(:save) if before_save == false
         if new?
           return save_failure(:create) if before_create == false
-          ds = model.dataset
-          if ds.respond_to?(:insert_select) and h = ds.insert_select(@values)
-            @values = h
-            @this = nil
-          else
-            iid = ds.insert(@values)
-            # if we have a regular primary key and it's not set in @values,
-            # we assume it's the last inserted id
-            if (pk = primary_key) && !(Array === pk) && !@values[pk]
-              @values[pk] = iid
-            end
-            @this = nil if pk
-          end
+          pk = _insert
+          @this = nil if pk
           @new = false
           @was_new = true
           after_create
@@ -808,22 +858,30 @@ module Sequel
             ds = this
             ds = ds.server(:default) unless ds.opts[:server]
             _refresh(ds)
+          else
+            changed_columns.clear
           end
         else
           return save_failure(:update) if before_update == false
           if columns.empty?
-            @columns_updated = opts[:changed] ? @values.reject{|k,v| !changed_columns.include?(k)} : @values
+            @columns_updated = opts[:changed] ? @values.reject{|k,v| !changed_columns.include?(k)} : @values.dup
             changed_columns.clear
           else # update only the specified columns
             @columns_updated = @values.reject{|k, v| !columns.include?(k)}
             changed_columns.reject!{|c| columns.include?(c)}
           end
-          this.update(@columns_updated)
+          Array(primary_key).each{|x| @columns_updated.delete(x)}
+          _update(@columns_updated) unless @columns_updated.empty?
           after_update
           after_save
           @columns_updated = nil
         end
+        @modified = false
         self
+      end
+      
+      def _update(columns)
+        this.update(columns)
       end
       
       # Default inspection output for the values hash, overwrite to change what #inspect displays.
@@ -856,7 +914,12 @@ module Sequel
         end
         self
       end
-  
+      
+      # Replace the current values with hash.
+      def set_values(hash)
+        @values = hash
+      end
+      
       # Returns all methods that can be used for attribute
       # assignment (those that end with =), modified by the only
       # and except arguments:
