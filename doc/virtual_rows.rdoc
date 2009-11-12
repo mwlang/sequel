@@ -21,7 +21,8 @@ called.  This is best shown by example:
   ds.select{rank(:over){}} # rank() OVER ()
   ds.select{count(:over, :*=>true){}} # count(*) OVER ()
   ds.select{sum(:over, :args=>col1, :partition=>col2, :order=>col3){}} # sum(col1) OVER (PARTITION BY col2 ORDER BY col3)
-  
+  ds.select{count(:id)} # count([id]) -- e.g. SQL Server ODBC delineates column names with square brackets
+  ds.select{[count(:*){}.as(:records), sum(:charges).as(:amount)]} # count(*) as [RECORDS], sum([CHARGES]) as [AMOUNT]
 Basically, the rules are:
 
 * If a block is given:
@@ -30,12 +31,15 @@ Basically, the rules are:
     method used, and no arguments.
   * If the first argument is :*, an SQL::Function is created with a single
     wildcard argument (*).
+  * when the first argument is not a column name, postfix "{}" to modify behavior to prevent
+    side effect of first argument being treated as a column name.
   * If the first argument is :distinct, an SQL::Function is created with
     the keyword DISTINCT prefacing all remaining arguments.
   * If the first argument is :over, the second argument if provided should
     be a hash of options to pass to SQL::Window.  The options hash can also
     contain :*=>true to use a wildcard argument as the function argument, or
     :args=>... to specify an array of arguments to use as the function arguments.
+  * use square brackets, [ ], and aliases (e.g. as) if you have more than one column result
 * If a block is not given:
   * If there are arguments, an SQL::Function is returned with the
     name of the method used and the arguments given.
