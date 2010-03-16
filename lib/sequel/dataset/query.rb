@@ -1,8 +1,5 @@
 module Sequel
   class Dataset
-
-    FROM_SELF_KEEP_OPTS = [:graph, :eager_graph, :graph_aliases]
-
     # Adds an further filter to an existing filter using AND. If no filter 
     # exists an error is raised. This method is identical to #filter except
     # it expects an existing filter.
@@ -144,11 +141,11 @@ module Sequel
     #
     #   ds = DB[:items].order(:name).select(:id, :name)
     #   ds.sql                         #=> "SELECT id,name FROM items ORDER BY name"
-    #   ds.from_self.sql               #=> "SELECT * FROM (SELECT id, name FROM items ORDER BY name) AS 't1'"
-    #   ds.from_self(:alias=>:foo).sql #=> "SELECT * FROM (SELECT id, name FROM items ORDER BY name) AS 'foo'"
+    #   ds.from_self.sql               #=> "SELECT * FROM (SELECT id, name FROM items ORDER BY name) AS t1"
+    #   ds.from_self(:alias=>:foo).sql #=> "SELECT * FROM (SELECT id, name FROM items ORDER BY name) AS foo"
     def from_self(opts={})
       fs = {}
-      @opts.keys.each{|k| fs[k] = nil unless FROM_SELF_KEEP_OPTS.include?(k)}
+      @opts.keys.each{|k| fs[k] = nil unless NON_SQL_OPTIONS.include?(k)}
       clone(fs).from(opts[:alias] ? as(opts[:alias]) : self)
     end
 
@@ -224,12 +221,16 @@ module Sequel
         o = l.first
         l = l.last - l.first + (l.exclude_end? ? 0 : 1)
       end
-      l = l.to_i
-      raise(Error, 'Limits must be greater than or equal to 1') unless l >= 1
+      l = l.to_i if l.is_a?(String) && !l.is_a?(LiteralString)
+      if l.is_a?(Integer)
+        raise(Error, 'Limits must be greater than or equal to 1') unless l >= 1
+      end
       opts = {:limit => l}
       if o
-        o = o.to_i
-        raise(Error, 'Offsets must be greater than or equal to 0') unless o >= 0
+        o = o.to_i if o.is_a?(String) && !o.is_a?(LiteralString)
+        if o.is_a?(Integer)
+          raise(Error, 'Offsets must be greater than or equal to 0') unless o >= 0
+        end
         opts[:offset] = o
       end
       clone(opts)
@@ -263,7 +264,7 @@ module Sequel
       columns += Array(Sequel.virtual_row(&block)) if block
       clone(:order => (columns.compact.empty?) ? nil : columns)
     end
-    alias_method :order_by, :order
+    alias order_by order
     
     # Returns a copy of the dataset with the order columns added
     # to the existing order.
@@ -288,7 +289,7 @@ module Sequel
     #
     #   dataset.select(:a) # SELECT a FROM items
     #   dataset.select(:a, :b) # SELECT a, b FROM items
-    #   dataset.select{|o| o.a, o.sum(:b)} # SELECT a, sum(b) FROM items
+    #   dataset.select{|o| [o.a, o.sum(:b)]} # SELECT a, sum(b) FROM items
     def select(*columns, &block)
       columns += Array(Sequel.virtual_row(&block)) if block
       m = []
@@ -370,7 +371,7 @@ module Sequel
     # Add the dataset to the list of compounds
     def compound_clone(type, dataset, opts)
       ds = compound_from_self.clone(:compounds=>Array(@opts[:compounds]).map{|x| x.dup} + [[type, dataset.compound_from_self, opts[:all]]])
-      opts[:from_self] == false ? ds : ds.from_self
+      opts[:from_self] == false ? ds : ds.from_self(opts)
     end
 
     # SQL fragment based on the expr type.  See #filter.

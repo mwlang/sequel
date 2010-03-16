@@ -267,6 +267,33 @@ context "A dataset with multiple tables in its FROM clause" do
   end
 end
 
+context "Dataset#unused_table_alias" do
+  before do
+    @ds = Sequel::Dataset.new(nil).from(:test)
+  end
+  
+  specify "should return given symbol if it hasn't already been used" do
+    @ds.unused_table_alias(:blah).should == :blah
+  end
+
+  specify "should return a symbol specifying an alias that hasn't already been used if it has already been used" do
+    @ds.unused_table_alias(:test).should == :test_0
+    @ds.from(:test, :test_0).unused_table_alias(:test).should == :test_1
+    @ds.from(:test, :test_0).cross_join(:test_1).unused_table_alias(:test).should == :test_2
+  end
+
+  specify "should return an appropriate symbol if given other forms of identifiers" do
+    @ds.unused_table_alias('test').should == :test_0
+    @ds.unused_table_alias(:b__t___test).should == :test_0
+    @ds.unused_table_alias(:b__test).should == :test_0
+    @ds.unused_table_alias(:test.qualify(:b)).should == :test_0
+    @ds.unused_table_alias(:b.as(:test)).should == :test_0
+    @ds.unused_table_alias(:b.as(:test.identifier)).should == :test_0
+    @ds.unused_table_alias(:b.as('test')).should == :test_0
+    @ds.unused_table_alias(:test.identifier).should == :test_0
+  end
+end
+
 context "Dataset#exists" do
   before do
     @ds1 = Sequel::Dataset.new(nil).from(:test)
@@ -419,9 +446,62 @@ context "Dataset#where" do
   specify "should accept a subquery" do
     @dataset.filter('gdp > ?', @d1.select(:avg.sql_function(:gdp))).sql.should ==
       "SELECT * FROM test WHERE (gdp > (SELECT avg(gdp) FROM test WHERE (region = 'Asia')))"
+  end
+  
+  specify "should handle all types of IN/NOT IN queries" do
+    @dataset.filter(:id => @d1.select(:id)).sql.should == "SELECT * FROM test WHERE (id IN (SELECT id FROM test WHERE (region = 'Asia')))"
+    @dataset.filter(:id => []).sql.should == "SELECT * FROM test WHERE (id != id)"
+    @dataset.filter(:id => [1, 2]).sql.should == "SELECT * FROM test WHERE (id IN (1, 2))"
+    @dataset.filter([:id1, :id2] => @d1.select(:id1, :id2)).sql.should == "SELECT * FROM test WHERE ((id1, id2) IN (SELECT id1, id2 FROM test WHERE (region = 'Asia')))"
+    @dataset.filter([:id1, :id2] => []).sql.should == "SELECT * FROM test WHERE ((id1 != id1) AND (id2 != id2))"
+    @dataset.filter([:id1, :id2] => [[1, 2], [3,4]].sql_array).sql.should == "SELECT * FROM test WHERE ((id1, id2) IN ((1, 2), (3, 4)))"
 
-    @dataset.filter(:id => @d1.select(:id)).sql.should ==
-      "SELECT * FROM test WHERE (id IN (SELECT id FROM test WHERE (region = 'Asia')))"
+    @dataset.exclude(:id => @d1.select(:id)).sql.should == "SELECT * FROM test WHERE (id NOT IN (SELECT id FROM test WHERE (region = 'Asia')))"
+    @dataset.exclude(:id => []).sql.should == "SELECT * FROM test WHERE (1 = 1)"
+    @dataset.exclude(:id => [1, 2]).sql.should == "SELECT * FROM test WHERE (id NOT IN (1, 2))"
+    @dataset.exclude([:id1, :id2] => @d1.select(:id1, :id2)).sql.should == "SELECT * FROM test WHERE ((id1, id2) NOT IN (SELECT id1, id2 FROM test WHERE (region = 'Asia')))"
+    @dataset.exclude([:id1, :id2] => []).sql.should == "SELECT * FROM test WHERE (1 = 1)"
+    @dataset.exclude([:id1, :id2] => [[1, 2], [3,4]].sql_array).sql.should == "SELECT * FROM test WHERE ((id1, id2) NOT IN ((1, 2), (3, 4)))"
+  end
+
+  specify "should handle IN/NOT IN queries with multiple columns and an array where the database doesn't support it" do
+    @dataset.meta_def(:supports_multiple_column_in?){false}
+    @dataset.filter([:id1, :id2] => []).sql.should == "SELECT * FROM test WHERE ((id1 != id1) AND (id2 != id2))"
+    @dataset.filter([:id1, :id2] => [[1, 2], [3,4]].sql_array).sql.should == "SELECT * FROM test WHERE (((id1 = 1) AND (id2 = 2)) OR ((id1 = 3) AND (id2 = 4)))"
+    @dataset.exclude([:id1, :id2] => []).sql.should == "SELECT * FROM test WHERE (1 = 1)"
+    @dataset.exclude([:id1, :id2] => [[1, 2], [3,4]].sql_array).sql.should == "SELECT * FROM test WHERE (((id1 != 1) OR (id2 != 2)) AND ((id1 != 3) OR (id2 != 4)))"
+  end
+
+  specify "should handle IN/NOT IN queries with multiple columns and a dataset where the database doesn't support it" do
+    @dataset.meta_def(:supports_multiple_column_in?){false}
+    d1 = @d1.select(:id1, :id2)
+    def d1.fetch_rows(sql)
+      @sql_used = sql
+      @columns = [:id1, :id2]
+      yield(:id1=>1, :id2=>2)
+      yield(:id1=>3, :id2=>4)
+    end
+    d1.instance_variable_get(:@sql_used).should == nil
+    @dataset.filter([:id1, :id2] => d1).sql.should == "SELECT * FROM test WHERE (((id1 = 1) AND (id2 = 2)) OR ((id1 = 3) AND (id2 = 4)))"
+    d1.instance_variable_get(:@sql_used).should == "SELECT id1, id2 FROM test WHERE (region = 'Asia')"
+    d1.instance_variable_set(:@sql_used, nil)
+    @dataset.exclude([:id1, :id2] => d1).sql.should == "SELECT * FROM test WHERE (((id1 != 1) OR (id2 != 2)) AND ((id1 != 3) OR (id2 != 4)))"
+    d1.instance_variable_get(:@sql_used).should == "SELECT id1, id2 FROM test WHERE (region = 'Asia')"
+  end
+  
+  specify "should handle IN/NOT IN queries with multiple columns and an empty dataset where the database doesn't support it" do
+    @dataset.meta_def(:supports_multiple_column_in?){false}
+    d1 = @d1.select(:id1, :id2)
+    def d1.fetch_rows(sql)
+      @sql_used = sql
+      @columns = [:id1, :id2]
+    end
+    d1.instance_variable_get(:@sql_used).should == nil
+    @dataset.filter([:id1, :id2] => d1).sql.should == "SELECT * FROM test WHERE ((id1 != id1) AND (id2 != id2))"
+    d1.instance_variable_get(:@sql_used).should == "SELECT id1, id2 FROM test WHERE (region = 'Asia')"
+    d1.instance_variable_set(:@sql_used, nil)
+    @dataset.exclude([:id1, :id2] => d1).sql.should == "SELECT * FROM test WHERE (1 = 1)"
+    d1.instance_variable_get(:@sql_used).should == "SELECT id1, id2 FROM test WHERE (region = 'Asia')"
   end
   
   specify "should accept a subquery for an EXISTS clause" do
@@ -828,6 +908,13 @@ context "Dataset#literal" do
   
   specify "should literalize Date properly" do
     d = Date.today
+    s = d.strftime("'%Y-%m-%d'")
+    @dataset.literal(d).should == s
+  end
+
+  specify "should literalize Date properly, even if to_s is overridden" do
+    d = Date.today
+    def d.to_s; "adsf" end
     s = d.strftime("'%Y-%m-%d'")
     @dataset.literal(d).should == s
   end
@@ -1276,6 +1363,21 @@ context "Dataset#limit" do
   specify "should include an offset if a second argument is given" do
     @dataset.limit(6, 10).sql.should ==
       'SELECT * FROM test LIMIT 6 OFFSET 10'
+    end
+    
+  specify "should convert regular strings to integers" do
+    @dataset.limit('6', 'a() - 1').sql.should ==
+      'SELECT * FROM test LIMIT 6 OFFSET 0'
+  end
+  
+  specify "should not convert literal strings to integers" do
+    @dataset.limit('6'.lit, 'a() - 1'.lit).sql.should ==
+      'SELECT * FROM test LIMIT 6 OFFSET a() - 1'
+  end
+    
+  specify "should not convert other objects" do
+    @dataset.limit(6, :a.sql_function - 1).sql.should ==
+      'SELECT * FROM test LIMIT 6 OFFSET (a() - 1)'
   end
   
   specify "should work with fixed sql datasets" do
@@ -1489,6 +1591,25 @@ context "Dataset#group_and_count" do
   specify "should format column aliases in the select clause but not in the group clause" do
     @ds.group_and_count(:name___n).sql.should ==
       "SELECT name AS n, count(*) AS count FROM test GROUP BY name ORDER BY count"
+    @ds.group_and_count(:name__n).sql.should ==
+      "SELECT name.n, count(*) AS count FROM test GROUP BY name.n ORDER BY count"
+  end
+
+  specify "should handle identifiers" do
+    @ds.group_and_count(:name___n.identifier).sql.should ==
+      "SELECT name___n, count(*) AS count FROM test GROUP BY name___n ORDER BY count"
+  end
+
+  specify "should handle literal strings" do
+    @ds.group_and_count("name".lit).sql.should ==
+      "SELECT name, count(*) AS count FROM test GROUP BY name ORDER BY count"
+  end
+
+  specify "should handle aliased expressions" do
+    @ds.group_and_count(:name.as(:n)).sql.should ==
+      "SELECT name AS n, count(*) AS count FROM test GROUP BY name ORDER BY count"
+    @ds.group_and_count(:name.identifier.as(:n)).sql.should ==
+      "SELECT name AS n, count(*) AS count FROM test GROUP BY name ORDER BY count"
   end
 end
 
@@ -1515,19 +1636,28 @@ context "Dataset#from_self" do
   before do
     @ds = Sequel::Dataset.new(nil).from(:test).select(:name).limit(1)
   end
+  
   specify "should set up a default alias" do
     @ds.from_self.sql.should == 'SELECT * FROM (SELECT name FROM test LIMIT 1) AS t1'
   end
+  
   specify "should modify only the new dataset" do
     @ds.from_self.select(:bogus).sql.should == 'SELECT bogus FROM (SELECT name FROM test LIMIT 1) AS t1'
   end
+  
   specify "should use the user-specified alias" do
     @ds.from_self(:alias=>:some_name).sql.should == 'SELECT * FROM (SELECT name FROM test LIMIT 1) AS some_name'
   end
+  
   specify "should use the user-specified alias for joins" do
     @ds.from_self(:alias=>:some_name).inner_join(:posts, :alias=>:name).sql.should == \
       'SELECT * FROM (SELECT name FROM test LIMIT 1) AS some_name INNER JOIN posts ON (posts.alias = some_name.name)'
   end
+  
+  specify "should not options such as server" do
+    @ds.server(:blah).from_self(:alias=>:some_name).opts[:server].should == :blah
+  end
+
 end
 
 context "Dataset#join_table" do
@@ -1824,6 +1954,11 @@ context "Dataset#join_table" do
     proc{@d.join(:categories, :a=>:d).delete_sql}.should raise_error(Sequel::InvalidOperation)
     proc{@d.join(:categories, :a=>:d).truncate_sql}.should raise_error(Sequel::InvalidOperation)
   end
+
+  specify "should raise an error if an invalid option is passed" do
+    proc{@d.join(:c, [:id], nil)}.should raise_error(Sequel::Error)
+    proc{@d.join(:c, [:id], :c.qualify(:d))}.should raise_error(Sequel::Error)
+  end
 end
 
 context "Dataset#[]=" do
@@ -2095,6 +2230,15 @@ context "Dataset compound operations" do
       "SELECT * FROM (SELECT * FROM b WHERE (z = 2) EXCEPT ALL SELECT * FROM a WHERE (z = 1)) AS t1"
   end
     
+  specify "should support :alias option for specifying identifier" do
+    @a.union(@b, :alias=>:xx).sql.should == \
+      "SELECT * FROM (SELECT * FROM a WHERE (z = 1) UNION SELECT * FROM b WHERE (z = 2)) AS xx"
+    @a.intersect(@b, :alias=>:xx).sql.should == \
+      "SELECT * FROM (SELECT * FROM a WHERE (z = 1) INTERSECT SELECT * FROM b WHERE (z = 2)) AS xx"
+    @a.except(@b, :alias=>:xx).sql.should == \
+      "SELECT * FROM (SELECT * FROM a WHERE (z = 1) EXCEPT SELECT * FROM b WHERE (z = 2)) AS xx"
+  end
+
   specify "should support :from_self=>false option to not wrap the compound in a SELECT * FROM (...)" do
     @b.union(@a, :from_self=>false).sql.should == \
       "SELECT * FROM b WHERE (z = 2) UNION SELECT * FROM a WHERE (z = 1)"
@@ -2646,6 +2790,10 @@ context "Dataset#update_sql" do
     @ds.update_sql("a = b").should == "UPDATE items SET a = b"
   end
   
+  specify "should handle implicitly qualified symbols" do
+    @ds.update_sql(:items__a=>:b).should == "UPDATE items SET items.a = b"
+  end
+  
   specify "should accept hash with string keys" do
     @ds.update_sql('c' => 'd').should == "UPDATE items SET c = 'd'"
   end
@@ -2999,7 +3147,7 @@ context Sequel::Dataset::UnnumberedArgumentMapper do
   end
   
   specify "should submitted the SQL to the database with placeholders and bind variables" do
-    @ps.each{|p| p.call(:n=>1)}
+    @ps.each{|p| p.prepared_sql; p.call(:n=>1)}
     @db.sqls.should == [["SELECT * FROM items WHERE (num = ?)", 1],
       ["SELECT * FROM items WHERE (num = ?)", 1],
       ["SELECT * FROM items WHERE (num = ?) LIMIT 1", 1],
@@ -3029,6 +3177,30 @@ context "Sequel::Dataset#server" do
       ['INSERT INTO items (a) VALUES (1)', :i],
       ['DELETE FROM items', :d],
       ['UPDATE items SET a = (a + 1)', :u]]
+  end
+end
+
+context "Sequel::Dataset#each_server" do
+  before do
+    @db = Sequel::Database.new(:servers=>{:s=>{}, :i=>{}})
+    @ds = @db[:items]
+    sqls = @sqls = []
+    @db.meta_def(:execute) do |sql, opts|
+      sqls << [sql, opts[:server]]
+    end
+    def @ds.fetch_rows(sql, &block)
+      execute(sql)
+    end
+  end
+
+  specify "should yield a dataset for each server" do
+    @ds.each_server do |ds|
+      ds.should be_a_kind_of(Sequel::Dataset)
+      ds.should_not == @ds
+      ds.sql.should == @ds.sql
+      ds.all
+    end
+    @sqls.sort_by{|sql, s| s.to_s}.should == [['SELECT * FROM items', :default], ['SELECT * FROM items', :i], ['SELECT * FROM items', :s]]
   end
 end
 
@@ -3239,6 +3411,30 @@ describe Sequel::SQL::Constants do
     @db.literal(Sequel::SQL::Constants::CURRENT_TIMESTAMP) == 'CURRENT_TIMESTAMP'
     @db.literal(Sequel::CURRENT_TIMESTAMP) == 'CURRENT_TIMESTAMP'
   end
+
+  it "should have NULL" do
+    @db.literal(Sequel::SQL::Constants::NULL) == 'NULL'
+    @db.literal(Sequel::NULL) == 'NULL'
+  end
+
+  it "should have NOTNULL" do
+    @db.literal(Sequel::SQL::Constants::NOTNULL) == 'NOT NULL'
+    @db.literal(Sequel::NOTNULL) == 'NOT NULL'
+  end
+
+  it "should have TRUE and SQLTRUE" do
+    @db.literal(Sequel::SQL::Constants::TRUE) == '1'
+    @db.literal(Sequel::TRUE) == '1'
+    @db.literal(Sequel::SQL::Constants::SQLTRUE) == '1'
+    @db.literal(Sequel::SQLTRUE) == '1'
+  end
+
+  it "should have FALSE and SQLFALSE" do
+    @db.literal(Sequel::SQL::Constants::FALSE) == '0'
+    @db.literal(Sequel::FALSE) == '0'
+    @db.literal(Sequel::SQL::Constants::SQLFALSE) == '0'
+    @db.literal(Sequel::SQLFALSE) == '0'
+  end
 end
 
 describe "Sequel timezone support" do
@@ -3383,5 +3579,140 @@ describe "Sequel timezone support" do
     Sequel.database_timezone.should == :utc
     Sequel.application_timezone.should == :utc
     Sequel.typecast_timezone.should == :utc
+  end
+end
+
+context "Sequel::Dataset#select_map" do
+  before do
+    @ds = MockDatabase.new[:t]
+    def @ds.fetch_rows(sql)
+      db << sql
+      yield({:c=>1})
+      yield({:c=>2})
+    end
+    @ds.db.reset
+  end
+
+  specify "should do select and map in one step" do
+    @ds.select_map(:a).should == [1, 2]
+    @ds.db.sqls.should == ['SELECT a FROM t']
+  end
+
+  specify "should handle implicit qualifiers in arguments" do
+    @ds.select_map(:a__b).should == [1, 2]
+    @ds.db.sqls.should == ['SELECT a.b FROM t']
+  end
+
+  specify "should handle implicit aliases in arguments" do
+    @ds.select_map(:a___b).should == [1, 2]
+    @ds.db.sqls.should == ['SELECT a AS b FROM t']
+  end
+
+  specify "should handle other objects" do
+    @ds.select_map("a".lit.as(:b)).should == [1, 2]
+    @ds.db.sqls.should == ['SELECT a AS b FROM t']
+  end
+  
+  specify "should accept a block" do
+    @ds.select_map{a(t__c)}.should == [1, 2]
+    @ds.db.sqls.should == ['SELECT a(t.c) FROM t']
+  end
+end
+
+context "Sequel::Dataset#select_order_map" do
+  before do
+    @ds = MockDatabase.new[:t]
+    def @ds.fetch_rows(sql)
+      db << sql
+      yield({:c=>1})
+      yield({:c=>2})
+    end
+    @ds.db.reset
+  end
+
+  specify "should do select and map in one step" do
+    @ds.select_order_map(:a).should == [1, 2]
+    @ds.db.sqls.should == ['SELECT a FROM t ORDER BY a']
+  end
+
+  specify "should handle implicit qualifiers in arguments" do
+    @ds.select_order_map(:a__b).should == [1, 2]
+    @ds.db.sqls.should == ['SELECT a.b FROM t ORDER BY a.b']
+  end
+
+  specify "should handle implicit aliases in arguments" do
+    @ds.select_order_map(:a___b).should == [1, 2]
+    @ds.db.sqls.should == ['SELECT a AS b FROM t ORDER BY a']
+  end
+
+  specify "should handle implicit qualifiers and aliases in arguments" do
+    @ds.select_order_map(:t__a___b).should == [1, 2]
+    @ds.db.sqls.should == ['SELECT t.a AS b FROM t ORDER BY t.a']
+  end
+
+  specify "should handle AliasedExpressions" do
+    @ds.select_order_map("a".lit.as(:b)).should == [1, 2]
+    @ds.db.sqls.should == ['SELECT a AS b FROM t ORDER BY a']
+  end
+  
+  specify "should accept a block" do
+    @ds.select_order_map{a(t__c)}.should == [1, 2]
+    @ds.db.sqls.should == ['SELECT a(t.c) FROM t ORDER BY a(t.c)']
+  end
+end
+
+context "Sequel::Dataset#select_hash" do
+  before do
+    @ds = MockDatabase.new[:t]
+    def @ds.set_fr_yield(hs)
+      @hs = hs
+    end
+    def @ds.fetch_rows(sql)
+      db << sql
+      @hs.each{|h| yield h}
+    end
+    @ds.db.reset
+  end
+
+  specify "should do select and map in one step" do
+    @ds.set_fr_yield([{:a=>1, :b=>2}, {:a=>3, :b=>4}])
+    @ds.select_hash(:a, :b).should == {1=>2, 3=>4}
+    @ds.db.sqls.should == ['SELECT a, b FROM t']
+  end
+
+  specify "should handle implicit qualifiers in arguments" do
+    @ds.set_fr_yield([{:a=>1, :b=>2}, {:a=>3, :b=>4}])
+    @ds.select_hash(:t__a, :t__b).should == {1=>2, 3=>4}
+    @ds.db.sqls.should == ['SELECT t.a, t.b FROM t']
+  end
+
+  specify "should handle implicit aliases in arguments" do
+    @ds.set_fr_yield([{:a=>1, :b=>2}, {:a=>3, :b=>4}])
+    @ds.select_hash(:c___a, :d___b).should == {1=>2, 3=>4}
+    @ds.db.sqls.should == ['SELECT c AS a, d AS b FROM t']
+  end
+
+  specify "should handle implicit qualifiers and aliases in arguments" do
+    @ds.set_fr_yield([{:a=>1, :b=>2}, {:a=>3, :b=>4}])
+    @ds.select_hash(:t__c___a, :t__d___b).should == {1=>2, 3=>4}
+    @ds.db.sqls.should == ['SELECT t.c AS a, t.d AS b FROM t']
+  end
+end
+
+context "Modifying joined datasets" do
+  before do
+    @ds = MockDatabase.new.from(:b, :c).join(:d, [:id]).where(:id => 2)
+    @ds.meta_def(:supports_modifying_joins?){true}
+    @ds.db.reset
+  end
+
+  specify "should allow deleting from joined datasets" do
+    @ds.delete
+    @ds.db.sqls.should == ['DELETE FROM b, c WHERE (id = 2)']
+  end
+
+  specify "should allow updating joined datasets" do
+    @ds.update(:a=>1)
+    @ds.db.sqls.should == ['UPDATE b, c INNER JOIN d USING (id) SET a = 1 WHERE (id = 2)']
   end
 end

@@ -17,18 +17,6 @@
 #
 #   Sequel.sqlite('blog.db'){|db| puts db[:users].count} 
 #
-# Sequel converts two digit years in Dates and DateTimes by default,
-# so 01/02/03 is interpreted at January 2nd, 2003, and 12/13/99 is interpreted
-# as December 13, 1999. You can override this to treat those dates as
-# January 2nd, 0003 and December 13, 0099, respectively, by setting: 
-#
-#   Sequel.convert_two_digit_years = false
-#
-# Sequel can use either Time or DateTime for times returned from the
-# database.  It defaults to Time.  To change it to DateTime, use:
-#
-#   Sequel.datetime_class = DateTime
-#
 # Sequel doesn't pay much attention to timezones by default, but you can set it
 # handle timezones if you want.  There are three separate timezone settings:
 #
@@ -62,9 +50,42 @@ module Sequel
   @convert_two_digit_years = true
   @datetime_class = Time
   @virtual_row_instance_eval = true
+  @require_thread = nil
+  
+  # Mutex used to protect file loading
+  @require_mutex = Mutex.new
   
   class << self
-    attr_accessor :convert_two_digit_years, :datetime_class, :virtual_row_instance_eval
+    # Sequel converts two digit years in Dates and DateTimes by default,
+    # so 01/02/03 is interpreted at January 2nd, 2003, and 12/13/99 is interpreted
+    # as December 13, 1999. You can override this to treat those dates as
+    # January 2nd, 0003 and December 13, 0099, respectively, by setting this to false.
+    attr_accessor :convert_two_digit_years
+
+    # Sequel can use either Time or DateTime for times returned from the
+    # database.  It defaults to Time.  To change it to DateTime, set this to DateTime.
+    attr_accessor :datetime_class
+
+    attr_accessor :virtual_row_instance_eval
+    
+    # Alias to the standard version of require
+    alias k_require require
+
+    private
+
+    # Make thread safe requiring reentrant to prevent deadlocks.
+    def check_requiring_thread
+      t = Thread.current
+      return(yield) if @require_thread == t
+      @require_mutex.synchronize do
+        begin
+          @require_thread = t 
+          yield
+        ensure
+          @require_thread = nil
+        end
+      end
+    end
   end
 
   # Returns true if the passed object could be a specifier of conditions, false otherwise.
@@ -117,7 +138,7 @@ module Sequel
   #   Sequel.extension(:schema_dumper)
   #   Sequel.extension(:pagination, :query)
   def self.extension(*extensions)
-    require(extensions, 'extensions')
+    extensions.each{|e| tsk_require "sequel/extensions/#{e}"}
   end
   
   # Set the method to call on identifiers going into the database.  This affects
@@ -158,7 +179,7 @@ module Sequel
   def self.quote_identifiers=(value)
     Database.quote_identifiers = value
   end
-
+  
   # Require all given files which should be in the same or a subdirectory of
   # this file.  If a subdir is given, assume all files are in that subdir.
   def self.require(files, subdir=nil)
@@ -205,6 +226,16 @@ module Sequel
     rescue => e
       raise convert_exception_class(e, InvalidValue)
     end
+  end
+
+  # Same as Sequel.require, but wrapped in a mutex in order to be thread safe.
+  def self.ts_require(*args)
+    check_requiring_thread{require(*args)}
+  end
+  
+  # Same as Kernel.require, but wrapped in a mutex in order to be thread safe.
+  def self.tsk_require(*args)
+    check_requiring_thread{k_require(*args)}
   end
 
   # If the supplied block takes a single argument,

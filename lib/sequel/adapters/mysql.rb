@@ -1,23 +1,14 @@
-require 'mysql'
+begin
+  require "mysqlplus"
+rescue LoadError
+  require 'mysql'
+end
 raise(LoadError, "require 'mysql' did not define Mysql::CLIENT_MULTI_RESULTS!\n  You are probably using the pure ruby mysql.rb driver,\n  which Sequel does not support. You need to install\n  the C based adapter, and make sure that the mysql.so\n  file is loaded instead of the mysql.rb file.\n") unless defined?(Mysql::CLIENT_MULTI_RESULTS)
+
 Sequel.require %w'shared/mysql utils/stored_procedures', 'adapters'
 
 module Sequel
   # Module for holding all MySQL-related classes and modules for Sequel.
-  #
-  # A class level convert_invalid_date_time accessor exists if
-  # the native adapter is used.  If set to nil or :nil, the adapter treats dates
-  # like 0000-00-00 and times like 838:00:00 as nil values.  If set to :string,
-  # it returns the strings as is.  It is false by default, which means that
-  # invalid dates and times will raise errors.
-  #
-  #   Sequel::MySQL.convert_invalid_date_time = true
-  #
-  # Sequel converts the column type tinyint(1) to a boolean by default when
-  # using the native MySQL adapter.  You can turn off the conversion to use
-  # tinyint as an integer:
-  #
-  #   Sequel.convert_tinyint_to_bool = false
   module MySQL
     # Mapping of type numbers to conversion procs
     MYSQL_TYPES = {}
@@ -41,7 +32,16 @@ module Sequel
     @convert_tinyint_to_bool = true
 
     class << self
-      attr_accessor :convert_invalid_date_time, :convert_tinyint_to_bool
+      # By default, Sequel raises an exception if in invalid date or time is used.
+      # However, if this is set to nil or :nil, the adapter treats dates
+      # like 0000-00-00 and times like 838:00:00 as nil values.  If set to :string,
+      # it returns the strings as is.  
+      attr_accessor :convert_invalid_date_time
+
+      # Sequel converts the column type tinyint(1) to a boolean by default when
+      # using the native MySQL adapter.  You can turn off the conversion by setting
+      # this to false.
+      attr_accessor :convert_tinyint_to_bool
     end
 
     # If convert_invalid_date_time is nil, :nil, or :string and
@@ -67,7 +67,7 @@ module Sequel
       include Sequel::MySQL::DatabaseMethods
       
       # Mysql::Error messages that indicate the current connection should be disconnected
-      MYSQL_DATABASE_DISCONNECT_ERRORS = /\A(Commands out of sync; you can't run this command now\z|Can't connect to local MySQL server through socket)/
+      MYSQL_DATABASE_DISCONNECT_ERRORS = /\A(Commands out of sync; you can't run this command now|Can't connect to local MySQL server through socket|MySQL server has gone away)/
       
       set_adapter_scheme :mysql
       
@@ -121,7 +121,6 @@ module Sequel
           attr_accessor :prepared_statements
         end
         conn.prepared_statements = {}
-        conn.reconnect = true
         conn
       end
       
@@ -158,35 +157,40 @@ module Sequel
           r = conn.query(sql)
           if opts[:type] == :select
             yield r if r
-            if conn.respond_to?(:next_result) && conn.next_result
-              loop do
-                if r
-                  r.free
-                  r = nil
-                end
-                begin
-                  r = conn.use_result
-                rescue Mysql::Error
-                  break
-                end
-                yield r
-                break unless conn.next_result
+          elsif block_given?
+            yield conn
+          end
+          if conn.respond_to?(:more_results?)
+            while conn.more_results? do
+              if r
+                r.free
+                r = nil
               end
+              begin
+                conn.next_result
+                r = conn.use_result
+              rescue Mysql::Error => e
+                raise_error(e, :disconnect=>true) if MYSQL_DATABASE_DISCONNECT_ERRORS.match(e.message)
+                break
+              end
+              yield r if opts[:type] == :select
             end
-          else
-            yield conn if block_given?
           end
         rescue Mysql::Error => e
           raise_error(e, :disconnect=>MYSQL_DATABASE_DISCONNECT_ERRORS.match(e.message))
         ensure
-          if r
-            r.free 
-            # Use up all results to avoid a commands out of sync message.
-            if conn.respond_to?(:next_result)
-              while conn.next_result
+          r.free if r
+          # Use up all results to avoid a commands out of sync message.
+          if conn.respond_to?(:more_results?)
+            while conn.more_results? do
+              begin
+                conn.next_result
                 r = conn.use_result
-                r.free if r
+              rescue Mysql::Error => e
+                raise_error(e, :disconnect=>true) if MYSQL_DATABASE_DISCONNECT_ERRORS.match(e.message)
+                break
               end
+              r.free if r
             end
           end
         end
@@ -195,11 +199,6 @@ module Sequel
       # MySQL connections use the query method to execute SQL without a result
       def connection_execute_method
         :query
-      end
-      
-      # MySQL doesn't need the connection pool to convert exceptions.
-      def connection_pool_default_options
-        super.merge(:pool_convert_exceptions=>false)
       end
       
       # The MySQL adapter main error class is Mysql::Error
@@ -312,7 +311,7 @@ module Sequel
       
       # Delete rows matching this dataset
       def delete
-        execute_dui(delete_sql){|c| c.affected_rows}
+        execute_dui(delete_sql){|c| return c.affected_rows}
       end
       
       # Yield all rows matching this dataset.  If the dataset is set to
@@ -342,7 +341,7 @@ module Sequel
       
       # Insert a new value into this dataset
       def insert(*values)
-        execute_dui(insert_sql(*values)){|c| c.insert_id}
+        execute_dui(insert_sql(*values)){|c| return c.insert_id}
       end
       
       # Store the given type of prepared statement in the associated database
@@ -359,7 +358,7 @@ module Sequel
       
       # Replace (update or insert) the matching row.
       def replace(*args)
-        execute_dui(replace_sql(*args)){|c| c.insert_id}
+        execute_dui(replace_sql(*args)){|c| return c.insert_id}
       end
       
       # Makes each yield arrays of rows, with each array containing the rows
@@ -380,7 +379,7 @@ module Sequel
       
       # Update the matching rows.
       def update(values={})
-        execute_dui(update_sql(values)){|c| c.affected_rows}
+        execute_dui(update_sql(values)){|c| return c.affected_rows}
       end
       
       private

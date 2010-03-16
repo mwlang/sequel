@@ -3,8 +3,7 @@ module Sequel
     COMMA_SEPARATOR = ', '.freeze
     COUNT_OF_ALL_AS_COUNT = SQL::Function.new(:count, LiteralString.new('*'.freeze)).as(:count)
     ARRAY_ACCESS_ERROR_MSG = 'You cannot call Dataset#[] with an integer or with no arguments.'.freeze
-    MAP_ERROR_MSG = 'Using Dataset#map with an argument and a block is not allowed'.freeze
-    GET_ERROR_MSG = 'must provide argument or block to Dataset#get, not both'.freeze
+    ARG_BLOCK_ERROR_MSG = 'Must use either an argument or a block, not both'.freeze
     IMPORT_ERROR_MSG = 'Using Sequel::Dataset#import an empty column array is not allowed'.freeze
 
     # Returns the first record matching the conditions. Examples:
@@ -74,7 +73,7 @@ module Sequel
     #   ds.get{|o| o.sum(:id)}
     def get(column=nil, &block)
       if column
-        raise(Error, GET_ERROR_MSG) if block
+        raise(Error, ARG_BLOCK_ERROR_MSG) if block
         select(column).single_value
       else
         select(&block).single_value
@@ -91,13 +90,9 @@ module Sequel
     #   ds.group_and_count(:first_name, :last_name).all => [{:first_name=>'a', :last_name=>'b', :count=>1}, ...]
     #   ds.group_and_count(:first_name___name).all => [{:name=>'a', :count=>1}, ...]
     def group_and_count(*columns)
-      groups = columns.map do |c|
-        c_table, column, _ = split_symbol(c)
-        c_table ? column.to_sym.qualify(c_table) : column.to_sym
-      end
-      group(*groups).select(*(columns + [COUNT_OF_ALL_AS_COUNT])).order(:count)
+      group(*columns.map{|c| unaliased_identifier(c)}).select(*(columns + [COUNT_OF_ALL_AS_COUNT])).order(:count)
     end
-    
+
     # Inserts multiple records into the associated table. This method can be
     # to efficiently insert a large amounts of records into a table. Inserts
     # are automatically wrapped in a transaction.
@@ -158,7 +153,7 @@ module Sequel
     #   ds.map{|r| r[:id] * 2} => [2, 4, 6, ...]
     def map(column=nil, &block)
       if column
-        raise(Error, MAP_ERROR_MSG) if block
+        raise(Error, ARG_BLOCK_ERROR_MSG) if block
         super(){|r| r[column]}
       else
         super(&block)
@@ -199,6 +194,39 @@ module Sequel
       end
     end
     
+    # Returns a hash with key_column values as keys and value_column values as
+    # values.  Similar to to_hash, but only selects the two columns.
+    def select_hash(key_column, value_column)
+      select(key_column, value_column).to_hash(hash_key_symbol(key_column), hash_key_symbol(value_column))
+    end
+    
+    # Selects the column given (either as an argument or as a block), and
+    # returns an array of all values of that column in the dataset.  If you
+    # give a block argument that returns an array with multiple entries,
+    # the contents of the resulting array are undefined.
+    def select_map(column=nil, &block)
+      ds = naked.ungraphed
+      ds = if column
+        raise(Error, ARG_BLOCK_ERROR_MSG) if block
+        ds.select(column)
+      else
+        ds.select(&block)
+      end
+      ds.map{|r| r.values.first}
+    end
+    
+    # The same as select_map, but in addition orders the array by the column.
+    def select_order_map(column=nil, &block)
+      ds = naked.ungraphed
+      ds = if column
+        raise(Error, ARG_BLOCK_ERROR_MSG) if block
+        ds.select(column).order(unaliased_identifier(column))
+      else
+        ds.select(&block).order(&block)
+      end
+      ds.map{|r| r.values.first}
+    end
+
     # Returns the first record in the dataset.
     def single_record
       clone(:limit=>1).each{|r| return r}
@@ -208,7 +236,7 @@ module Sequel
     # Returns the first value of the first record in the dataset.
     # Returns nil if dataset is empty.
     def single_value
-      if r = naked.clone(:graph=>false).single_record
+      if r = naked.ungraphed.single_record
         r.values.first
       end
     end
@@ -243,6 +271,55 @@ module Sequel
       inject({}) do |m, r|
         m[r[key_column]] = value_column ? r[value_column] : r
         m
+      end
+    end
+
+    # Creates a unique table alias that hasn't already been used in the dataset.
+    # table_alias can be any type of object accepted by alias_symbol.
+    # The symbol returned will be the implicit alias in the argument,
+    # possibly appended with "_N" if the implicit alias has already been
+    # used, where N is an integer starting at 0 and increasing until an
+    # unused one is found.
+    def unused_table_alias(table_alias)
+      table_alias = alias_symbol(table_alias)
+      used_aliases = []
+      used_aliases += opts[:from].map{|t| alias_symbol(t)} if opts[:from]
+      used_aliases += opts[:join].map{|j| j.table_alias ? alias_alias_symbol(j.table_alias) : alias_symbol(j.table)} if opts[:join]
+      if used_aliases.include?(table_alias)
+        i = 0
+        loop do
+          ta = :"#{table_alias}_#{i}"
+          return ta unless used_aliases.include?(ta)
+          i += 1 
+        end
+      else
+        table_alias
+      end
+    end
+
+    private
+
+    # Return a plain symbol given a potentially qualified or aliased symbol,
+    # specifying the symbol that is likely to be used as the hash key
+    # for the column when records are returned.
+    def hash_key_symbol(s)
+      raise(Error, "#{s.inspect} is not a symbol") unless s.is_a?(Symbol)
+      _, c, a = split_symbol(s)
+      (a || c).to_sym
+    end
+
+    # Return the unaliased part of the identifier.  Handles both
+    # implicit aliases in symbols, as well as SQL::AliasedExpression
+    # objects.  Other objects are returned as is.
+    def unaliased_identifier(c)
+      case c
+      when Symbol
+        c_table, column, _ = split_symbol(c)
+        c_table ? column.to_sym.qualify(c_table) : column.to_sym
+      when SQL::AliasedExpression
+        c.expression
+      else
+        c
       end
     end
   end

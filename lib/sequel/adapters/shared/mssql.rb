@@ -8,7 +8,7 @@ module Sequel
       SQL_BEGIN = "BEGIN TRANSACTION".freeze
       SQL_COMMIT = "COMMIT TRANSACTION".freeze
       SQL_ROLLBACK = "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION".freeze
-      SQL_ROLLBACK_TO_SAVEPOINT = 'ROLLBACK TRANSACTION autopoint_%d'.freeze
+      SQL_ROLLBACK_TO_SAVEPOINT = 'IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION autopoint_%d'.freeze
       SQL_SAVEPOINT = 'SAVE TRANSACTION autopoint_%d'.freeze
       TEMPORARY = "#".freeze
       
@@ -183,7 +183,7 @@ module Sequel
       COMMA_SEPARATOR = ', '.freeze
       DELETE_CLAUSE_METHODS = Dataset.clause_methods(:delete, %w'with from output from2 where')
       INSERT_CLAUSE_METHODS = Dataset.clause_methods(:insert, %w'with into columns output values')
-      SELECT_CLAUSE_METHODS = Dataset.clause_methods(:select, %w'with limit distinct columns from table_options join where group order having compounds')
+      SELECT_CLAUSE_METHODS = Dataset.clause_methods(:select, %w'with limit distinct columns into from table_options join where group having order compounds')
       UPDATE_CLAUSE_METHODS = Dataset.clause_methods(:update, %w'with table set output from where')
       WILDCARD = LiteralString.new('*').freeze
       CONSTANT_MAP = {:CURRENT_DATE=>'CAST(CURRENT_TIMESTAMP AS DATE)'.freeze, :CURRENT_TIME=>'CAST(CURRENT_TIMESTAMP AS TIME)'.freeze}
@@ -230,7 +230,13 @@ module Sequel
 
       # Use the OUTPUT clause to get the value of all columns for the newly inserted record.
       def insert_select(*values)
+        return unless supports_output_clause?
         naked.clone(default_server_opts(:sql=>output(nil, [:inserted.*]).insert_sql(*values))).single_record unless opts[:disable_insert_output]
+      end
+
+      # Specify a table for a SELECT ... INTO query.
+      def into(table)
+        clone(:into => table)
       end
 
       # MSSQL uses a UNION ALL statement to insert multiple values at once.
@@ -256,6 +262,7 @@ module Sequel
       #   dataset.output(:output_table, [:deleted__id, :deleted__name])
       #   dataset.output(:output_table, :id => :inserted__id, :name => :inserted__name)
       def output(into, values)
+        raise(Error, "SQL Server versions 2000 and earlier do not support the OUTPUT clause") unless supports_output_clause?
         output = {}
         case values
           when Hash
@@ -283,7 +290,7 @@ module Sequel
       # 
       # The implementation is ugly, cloning the current dataset and modifying
       # the clone to add a ROW_NUMBER window function (and some other things),
-      # then using the modified clone in a CTE which is selected from.
+      # then using the modified clone in a subselect which is selected from.
       #
       # If offset is used, an order must be provided, because the use of ROW_NUMBER
       # requires an order.
@@ -291,16 +298,15 @@ module Sequel
         return super unless o = @opts[:offset]
         raise(Error, 'MSSQL requires an order be provided if using an offset') unless order = @opts[:order]
         dsa1 = dataset_alias(1)
-        dsa2 = dataset_alias(2)
         rn = row_number_column
-        unlimited.
+        sel = [Sequel::SQL::WindowFunction.new(:ROW_NUMBER.sql_function, Sequel::SQL::Window.new(:order=>order)).as(rn)]
+        sel.unshift(WILDCARD) unless osel = @opts[:select] and !osel.empty?
+        subselect_sql(unlimited.
           unordered.
-          from_self(:alias=>dsa2).
-          select{[WILDCARD, ROW_NUMBER(:over, :order=>order){}.as(rn)]}.
+          select_more(*sel).
           from_self(:alias=>dsa1).
           limit(@opts[:limit]).
-          where(rn > o).
-          select_sql
+          where(SQL::Identifier.new(rn) > o))
       end
 
       # The version of the database server.
@@ -323,9 +329,19 @@ module Sequel
         false
       end
 
+      # MSSQL 2005+ supports modifying joined datasets
+      def supports_modifying_joins?
+        true
+      end
+
       # MSSQL does not support multiple columns for the IN/NOT IN operators
       def supports_multiple_column_in?
         false
+      end
+      
+      # Only 2005+ supports the output clause.
+      def supports_output_clause?
+        server_version >= 9000000
       end
 
       # MSSQL 2005+ supports window functions
@@ -335,17 +351,26 @@ module Sequel
 
       private
 
-      # MSSQL can modify joined datasets
-      def check_modification_allowed!
-        raise(InvalidOperation, "Grouped datasets cannot be modified") if opts[:group]
-      end
-
       # MSSQL supports the OUTPUT clause for DELETE statements.
       # It also allows prepending a WITH clause.
       def delete_clause_methods
         DELETE_CLAUSE_METHODS
       end
 
+      # Only include the primary table in the main delete clause
+      def delete_from_sql(sql)
+        sql << " FROM #{source_list(@opts[:from][0..0])}"
+      end
+
+      # MSSQL supports FROM clauses in DELETE and UPDATE statements.
+      def delete_from2_sql(sql)
+        if joined_dataset?
+          select_from_sql(sql)
+          select_join_sql(sql)
+        end
+      end
+      alias update_from_sql delete_from2_sql
+      
       # Handle the with clause for delete, insert, and update statements
       # to be the same as the insert statement.
       def delete_with_sql(sql)
@@ -361,16 +386,6 @@ module Sequel
         sprintf(".%03d", usec/1000)
       end
 
-      # MSSQL supports FROM clauses in DELETE and UPDATE statements.
-      def from_sql(sql)
-        if (opts[:from].is_a?(Array) && opts[:from].size > 1) || opts[:join]
-          select_from_sql(sql)
-          select_join_sql(sql)
-        end
-      end
-      alias delete_from2_sql from_sql
-      alias update_from_sql from_sql
-      
       # MSSQL supports the OUTPUT clause for INSERT statements.
       # It also allows prepending a WITH clause.
       def insert_clause_methods
@@ -384,9 +399,9 @@ module Sequel
         blob
       end
       
-      # Use unicode string syntax for all strings
+      # Use unicode string syntax for all strings. Don't double backslashes.
       def literal_string(v)
-        "N#{super}"
+        "N'#{v.gsub(/'/, "''")}'"
       end
       
       # Use 0 for false on MSSQL
@@ -409,9 +424,13 @@ module Sequel
         SELECT_CLAUSE_METHODS
       end
 
+      def select_into_sql(sql)
+        sql << " INTO #{table_ref(@opts[:into])}" if @opts[:into]
+      end
+
       # MSSQL uses TOP for limit
       def select_limit_sql(sql)
-        sql << " TOP #{@opts[:limit]}" if @opts[:limit]
+        sql << " TOP (#{literal(@opts[:limit])})" if @opts[:limit]
       end
 
       # MSSQL uses the WITH statement to lock tables
@@ -421,6 +440,7 @@ module Sequel
 
       # SQL fragment for MSSQL's OUTPUT clause.
       def output_sql(sql)
+        return unless supports_output_clause?
         return unless output = @opts[:output]
         sql << " OUTPUT #{column_list(output[:select_list])}"
         if into = output[:into]
@@ -440,6 +460,11 @@ module Sequel
       # It also allows prepending a WITH clause.
       def update_clause_methods
         UPDATE_CLAUSE_METHODS
+      end
+
+      # Only include the primary table in the main update clause
+      def update_table_sql(sql)
+        sql << " #{source_list(@opts[:from][0..0])}"
       end
     end
   end

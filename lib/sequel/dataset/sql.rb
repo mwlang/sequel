@@ -1,6 +1,5 @@
 module Sequel
   class Dataset
-
     # Given a type (e.g. select) and an array of clauses,
     # return an array of methods to call to build the SQL string.
     def self.clause_methods(type, clauses)
@@ -52,6 +51,11 @@ module Sequel
       a.empty? ? '(NULL)' : "(#{expression_list(a)})"     
     end
 
+    # SQL fragment for BooleanConstants
+    def boolean_constant_sql(constant)
+      literal(constant)
+    end
+
     # SQL fragment for specifying given CaseExpression.
     def case_expression_sql(ce)
       sql = '(CASE '
@@ -87,11 +91,42 @@ module Sequel
         end
       when :IN, :"NOT IN"
         cols = args.at(0)
-        if !supports_multiple_column_in? && cols.is_a?(Array)
-          expr = SQL::BooleanExpression.new(:OR, *args.at(1).to_a.map{|vals| SQL::BooleanExpression.from_value_pairs(cols.zip(vals).map{|col, val| [col, val]})})
-          literal(op == :IN ? expr : ~expr)
+        vals = args.at(1)
+        col_array = true if cols.is_a?(Array) || cols.is_a?(SQL::SQLArray)
+        if vals.is_a?(Array) || vals.is_a?(SQL::SQLArray)
+          val_array = true
+          empty_val_array = vals.to_a == []
+        end
+        if col_array
+          if empty_val_array
+            if op == :IN
+              literal(SQL::BooleanExpression.from_value_pairs(cols.to_a.map{|x| [x, x]}, :AND, true))
+            else
+              literal(1=>1)
+            end
+          elsif !supports_multiple_column_in?
+            if val_array
+              expr = SQL::BooleanExpression.new(:OR, *vals.to_a.map{|vs| SQL::BooleanExpression.from_value_pairs(cols.to_a.zip(vs).map{|c, v| [c, v]})})
+              literal(op == :IN ? expr : ~expr)
+            else
+              old_vals = vals
+              vals = vals.to_a
+              val_cols = old_vals.columns
+              complex_expression_sql(op, [cols, vals.map!{|x| x.values_at(*val_cols)}])
+            end
+          else
+            "(#{literal(cols)} #{op} #{literal(vals)})"
+          end
         else
-          "(#{literal(cols)} #{op} #{literal(args.at(1))})"
+          if empty_val_array
+            if op == :IN
+              literal(SQL::BooleanExpression.from_value_pairs([[cols, cols]], :AND, true))
+            else
+              literal(1=>1)
+            end
+          else
+            "(#{literal(cols)} #{op} #{literal(vals)})"
+          end
         end
       when *TWO_ARITY_OPERATORS
         "(#{literal(args.at(0))} #{op} #{literal(args.at(1))})"
@@ -284,13 +319,17 @@ module Sequel
         return join_table(type, table, h, options)
       end
 
-      if [Symbol, String].any?{|c| options.is_a?(c)}
+      case options
+      when Hash
+        table_alias = options[:table_alias]
+        last_alias = options[:implicit_qualifier]
+      when Symbol, String, SQL::Identifier
         table_alias = options
         last_alias = nil 
       else
-        table_alias = options[:table_alias]
-        last_alias = options[:implicit_qualifier]
+        raise Error, "invalid options format for join_table: #{options.inspect}"
       end
+
       if Dataset === table
         if table_alias.nil?
           table_alias_num = (@opts[:num_dataset_sources] || 0) + 1
@@ -356,7 +395,7 @@ module Sequel
       when BigDecimal
         literal_big_decimal(v)
       when NilClass
-        NULL
+        literal_nil
       when TrueClass
         literal_true
       when FalseClass
@@ -386,6 +425,11 @@ module Sequel
       values.map{|r| insert_sql(columns, r)}
     end
     
+    # SQL fragment for NegativeBooleanConstants
+    def negative_boolean_constant_sql(constant)
+      "NOT #{boolean_constant_sql(constant)}"
+    end
+
     # SQL fragment for the ordered expression, used in the ORDER BY
     # clause.
     def ordered_expression_sql(oe)
@@ -621,6 +665,41 @@ module Sequel
       "TRUNCATE TABLE #{table}"
     end
 
+    # Returns an appropriate symbol for the alias represented by s.
+    def alias_alias_symbol(s)
+      case s
+      when Symbol
+        s
+      when String
+        s.to_sym
+      when SQL::Identifier
+        s.value.to_s.to_sym
+      else
+        raise Error, "Invalid alias for alias_alias_symbol: #{s.inspect}"
+      end
+    end
+
+    # Returns an appropriate alias symbol for the given object, which can be
+    # a Symbol, String, SQL::Identifier, SQL::QualifiedIdentifier, or
+    # SQL::AliasedExpression.
+    def alias_symbol(sym)
+      case sym
+      when Symbol
+        s, t, a = split_symbol(sym)
+        a || s ? (a || t).to_sym : sym
+      when String
+        sym.to_sym
+      when SQL::Identifier
+        sym.value.to_s.to_sym
+      when SQL::QualifiedIdentifier
+        alias_symbol(sym.column)
+      when SQL::AliasedExpression
+        alias_alias_symbol(sym.aliaz)
+      else
+        raise Error, "Invalid alias for alias_symbol: #{sym.inspect}"
+      end
+    end
+
     # Clone of this dataset usable in aggregate operations.  Does
     # a from_self if dataset contains any parameters that would
     # affect normal aggregation, or just removes an existing
@@ -643,7 +722,7 @@ module Sequel
     # for this dataset
     def check_modification_allowed!
       raise(InvalidOperation, "Grouped datasets cannot be modified") if opts[:group]
-      raise(InvalidOperation, "Joined datasets cannot be modified") if (opts[:from].is_a?(Array) && opts[:from].size > 1) || opts[:join]
+      raise(InvalidOperation, "Joined datasets cannot be modified") if !supports_modifying_joins? && joined_dataset?
     end
 
     # Prepare an SQL statement by calling all clause methods for the given statement type.
@@ -754,6 +833,11 @@ module Sequel
       "#{join_type.to_s.gsub('_', ' ').upcase} JOIN"
     end
 
+    # Whether this dataset is a joined dataset
+    def joined_dataset?
+     (opts[:from].is_a?(Array) && opts[:from].size > 1) || opts[:join]
+    end
+
     # SQL fragment for Array.  Treats as an expression if an array of all two pairs, or as a SQL array otherwise.
     def literal_array(v)
       Sequel.condition_specifier?(v) ? literal_expression(SQL::BooleanExpression.from_value_pairs(v)) : array_sql(v)
@@ -777,7 +861,7 @@ module Sequel
 
     # SQL fragment for Date, using the ISO8601 format.
     def literal_date(v)
-      requires_sql_standard_datetimes? ? v.strftime("DATE '%Y-%m-%d'") : "'#{v}'"
+      v.strftime("#{'DATE ' if requires_sql_standard_datetimes?}'%Y-%m-%d'")
     end
 
     # SQL fragment for DateTime
@@ -808,6 +892,11 @@ module Sequel
     # SQL fragment for Integer
     def literal_integer(v)
       v.to_s
+    end
+    
+    # SQL fragment for nil
+    def literal_nil
+      NULL
     end
 
     # SQL fragment for a type of object not handled by Dataset#literal.
@@ -982,8 +1071,8 @@ module Sequel
 
     # Modify the sql to limit the number of rows returned and offset
     def select_limit_sql(sql)
-      sql << " LIMIT #{@opts[:limit]}" if @opts[:limit]
-      sql << " OFFSET #{@opts[:offset]}" if @opts[:offset]
+      sql << " LIMIT #{literal(@opts[:limit])}" if @opts[:limit]
+      sql << " OFFSET #{literal(@opts[:offset])}" if @opts[:offset]
     end
 
     # Modify the sql to add the expressions to ORDER BY
@@ -1058,9 +1147,11 @@ module Sequel
       UPDATE_CLAUSE_METHODS
     end
 
-    # SQL fragment specifying the tables from with to delete
+    # SQL fragment specifying the tables from with to delete.
+    # Includes join table if modifying joins is allowed.
     def update_table_sql(sql)
       sql << " #{source_list(@opts[:from])}"
+      select_join_sql(sql) if supports_modifying_joins?
     end
 
     # The SQL fragment specifying the columns and values to SET.
@@ -1071,7 +1162,7 @@ module Sequel
         values = values.merge(opts[:overrides]) if opts[:overrides]
         # get values from hash
         values.map do |k, v|
-          "#{[String, Symbol].any?{|c| k.is_a?(c)} ? quote_identifier(k) : literal(k)} = #{literal(v)}"
+          "#{k.is_a?(String) && !k.is_a?(LiteralString) ? quote_identifier(k) : literal(k)} = #{literal(v)}"
         end.join(COMMA_SEPARATOR)
       else
         # copy values verbatim

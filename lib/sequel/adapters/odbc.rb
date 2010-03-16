@@ -9,13 +9,13 @@ module Sequel
       DRV_NAME_GUARDS = '{%s}'.freeze
 
       def initialize(opts)
-        super(opts)
-        case opts[:db_type]
+        super
+        case @opts[:db_type]
         when 'mssql'
-          Sequel.require 'adapters/odbc/mssql'
+          Sequel.ts_require 'adapters/odbc/mssql'
           extend Sequel::ODBC::MSSQL::DatabaseMethods
         when 'progress'
-          Sequel.require 'adapters/shared/progress'
+          Sequel.ts_require 'adapters/shared/progress'
           extend Sequel::Progress::DatabaseMethods
         end
       end
@@ -50,7 +50,7 @@ module Sequel
           begin
             r = conn.run(sql)
             yield(r) if block_given?
-          rescue ::ODBC::Error => e
+          rescue ::ODBC::Error, ArgumentError => e
             raise_error(e)
           ensure
             r.drop if r
@@ -64,7 +64,7 @@ module Sequel
         synchronize(opts[:server]) do |conn|
           begin
             conn.do(sql)
-          rescue ::ODBC::Error => e
+          rescue ::ODBC::Error, ArgumentError => e
             raise_error(e)
           end
         end
@@ -72,10 +72,6 @@ module Sequel
       alias do execute_dui
 
       private
-      
-      def connection_pool_default_options
-        super.merge(:pool_convert_exceptions=>false)
-      end
       
       def connection_execute_method
         :do

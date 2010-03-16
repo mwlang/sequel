@@ -104,6 +104,10 @@ describe Sequel::Model do
     @o.errors[:score].should == ['too low']
     @o.errors[:blah].should be_empty
   end
+  
+  specify "should allow raising of ValidationFailed with a string" do
+    proc{raise Sequel::ValidationFailed, "no reason"}.should raise_error(Sequel::ValidationFailed, "no reason")
+  end
 end
 
 describe "Model#save" do
@@ -139,7 +143,7 @@ describe "Model#save" do
   end
     
   specify "should raise error if validations fail and raise_on_save_faiure is true" do
-    proc{@m.save}.should raise_error(Sequel::ValidationFailed)
+    proc{@m.save}.should raise_error(Sequel::ValidationFailed){ |e| e.errors.should == @m.errors }
   end
   
   specify "should return nil if validations fail and raise_on_save_faiure is false" do

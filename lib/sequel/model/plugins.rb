@@ -5,8 +5,9 @@ module Sequel
   # Plugins should be modules with one of the following conditions:
   # * A singleton method named apply, which takes a model, 
   #   additional arguments, and an optional block.  This is called
-  #   once, the first time the plugin is loaded, with the arguments
-  #   and block provide to the call to Model.plugin.
+  #   the first time the plugin is loaded for this model (unless it was
+  #   already loaded by an ancestor class), with the arguments
+  #   and block provided to the call to Model.plugin.
   # * A module inside the plugin module named InstanceMethods,
   #   which will be included in the model class.
   # * A module inside the plugin module named ClassMethods,
@@ -59,25 +60,15 @@ module Sequel
       
       private
   
-      # Returns the new style location for the plugin name.
-      def plugin_gem_location(plugin)
-        "sequel/plugins/#{plugin}"
-      end
-
-      # Returns the old style location for the plugin name.
-      def plugin_gem_location_old(plugin)
-        "sequel_#{plugin}"
-      end
-  
       # Returns the module for the specified plugin. If the module is not 
       # defined, the corresponding plugin gem is automatically loaded.
       def plugin_module(plugin)
         module_name = plugin.to_s.gsub(/(^|_)(.)/){|x| x[-1..-1].upcase}
         if not Sequel::Plugins.const_defined?(module_name)
           begin
-            require plugin_gem_location(plugin)
+            Sequel.tsk_require "sequel/plugins/#{plugin}"
           rescue LoadError
-            require plugin_gem_location_old(plugin)
+            Sequel.tsk_require "sequel_#{plugin}"
           end
         end
         Sequel::Plugins.const_get(module_name)

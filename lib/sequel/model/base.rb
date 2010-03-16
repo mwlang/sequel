@@ -290,13 +290,7 @@ module Sequel
           @dataset_methods.each{|meth, block| @dataset.meta_def(meth, &block)} if @dataset_methods
         end
         @dataset.model = self if @dataset.respond_to?(:model=)
-        begin
-          @db_schema = (inherited ? superclass.db_schema : get_db_schema)
-        rescue Sequel::DatabaseConnectionError
-          raise
-        rescue
-          nil
-        end
+        check_non_connection_error{@db_schema = (inherited ? superclass.db_schema : get_db_schema)}
         self
       end
       alias dataset= set_dataset
@@ -368,6 +362,17 @@ module Sequel
   
       private
       
+      # Yield to the passed block and swallow all errors other than DatabaseConnectionErrors.
+      def check_non_connection_error
+        begin
+          yield
+        rescue Sequel::DatabaseConnectionError
+          raise
+        rescue
+          nil
+        end
+      end
+
       # Create a column accessor for a column with a method name that is hard to use in ruby code.
       def def_bad_column_accessor(column)
         overridable_methods_module.module_eval do
@@ -399,15 +404,7 @@ module Sequel
         ds_opts = dataset.opts
         single_table = ds_opts[:from] && (ds_opts[:from].length == 1) \
           && !ds_opts.include?(:join) && !ds_opts.include?(:sql)
-        get_columns = proc do
-          begin
-            columns
-          rescue Sequel::DatabaseConnectionError
-            raise
-          rescue
-            []
-          end
-        end
+        get_columns = proc{check_non_connection_error{columns} || []}
         if single_table && (schema_array = (db.schema(table_name, :reload=>reload) rescue nil))
           schema_array.each{|k,v| schema_hash[k] = v}
           if ds_opts.include?(:select)
@@ -507,7 +504,7 @@ module Sequel
 
       class_attr_reader :columns, :db, :primary_key, :db_schema
       class_attr_overridable :raise_on_save_failure, :raise_on_typecast_failure, :strict_param_setting, :typecast_empty_string_to_nil, :typecast_on_assignment, :use_transactions
-      
+
       # The hash of attribute values.  Keys are symbols with the names of the
       # underlying database columns.
       attr_reader :values
@@ -576,7 +573,7 @@ module Sequel
       # self.class.
       alias_method :model, :class
   
-      # The current cached associations.  A hash with the keys being the
+      # The currently cached associations.  A hash with the keys being the
       # association name symbols and the values being the associated object
       # or nil (many_to_one), or the array of associated objects (*_to_many).
       def associations
@@ -607,9 +604,10 @@ module Sequel
       # If before_destroy returns false, returns false without
       # deleting the object the the database. Otherwise, deletes
       # the item from the database and returns self.  Uses a transaction
-      # if use_transactions is true.
-      def destroy
-        use_transactions ? db.transaction{_destroy} : _destroy
+      # if use_transactions is true or if the :transaction option is given and
+      # true.
+      def destroy(opts = {})
+        checked_save_failure{checked_transaction(opts){_destroy(opts)}}
       end
 
       # Iterates through all of the current values using each.
@@ -721,9 +719,11 @@ module Sequel
       # * :validate - set to false not to validate the model before saving
       def save(*columns)
         opts = columns.last.is_a?(Hash) ? columns.pop : {}
-        return save_failure(:invalid) if opts[:validate] != false and !valid?
-        use_transaction = opts.include?(:transaction) ? opts[:transaction] : use_transactions
-        use_transaction ? db.transaction(opts){_save(columns, opts)} : _save(columns, opts)
+        if opts[:validate] != false and !valid?
+          raise(ValidationFailed.new(errors)) if raise_on_save_failure
+          return
+        end
+        checked_save_failure{checked_transaction(opts){_save(columns, opts)}}
       end
 
       # Saves only changed columns if the object has been modified.
@@ -797,7 +797,7 @@ module Sequel
       def valid?
         errors.clear
         if before_validation == false
-          save_failure(:validation)
+          save_failure(:validation) if raise_on_save_failure
           return false
         end
         validate
@@ -809,13 +809,20 @@ module Sequel
   
       # Internal destroy method, separted from destroy to
       # allow running inside a transaction
-      def _destroy
+      def _destroy(opts)
         return save_failure(:destroy) if before_destroy == false
-        delete
+        _destroy_delete
         after_destroy
         self
       end
       
+      # Internal delete method to call when destroying an object,
+      # separated from delete to allow you to override destroy's version
+      # without affecting delete.
+      def _destroy_delete
+        delete
+      end
+
       def _insert
         ds = model.dataset
         if ds.respond_to?(:insert_select) and h = ds.insert_select(@values)
@@ -880,10 +887,30 @@ module Sequel
         self
       end
       
+      # Update this instance's dataset with the supplied column hash.
       def _update(columns)
         this.update(columns)
       end
+
+      # If raise_on_save_failure is false, check for BeforeHookFailed
+      # beind raised by yielding and swallow it.
+      def checked_save_failure
+        if raise_on_save_failure
+          yield
+        else
+          begin
+            yield
+          rescue BeforeHookFailed 
+            nil
+          end
+        end
+      end
       
+      # If transactions should be used, wrap the yield in a transaction block.
+      def checked_transaction(opts)
+        use_transaction?(opts) ? db.transaction(opts){yield} : yield
+      end
+
       # Default inspection output for the values hash, overwrite to change what #inspect displays.
       def inspect_values
         @values.inspect
@@ -891,13 +918,7 @@ module Sequel
   
       # Raise an error if raise_on_save_failure is true, return nil otherwise.
       def save_failure(type)
-        if raise_on_save_failure
-          if type == :invalid
-            raise ValidationFailed, errors.full_messages.join(', ')
-          else
-            raise BeforeHookFailed, "one of the before_#{type} hooks returned false"
-          end
-        end
+        raise BeforeHookFailed, "one of the before_#{type} hooks returned false"
       end
   
       # Set the columns, filtered by the only and except arrays.
@@ -967,6 +988,13 @@ module Sequel
       def update_restricted(hash, only, except)
         set_restricted(hash, only, except)
         save_changes
+      end
+      
+      # Whether to use a transaction for this action.  If the :transaction
+      # option is present in the hash, use that, otherwise, fallback to the
+      # object's default (if set), or class's default (if not).
+      def use_transaction?(opts = {})
+        opts.include?(:transaction) ? opts[:transaction] : use_transactions
       end
     end
 

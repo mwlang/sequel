@@ -66,7 +66,7 @@ end
 describe "Sequel::Database dump methods" do
   before do
     @d = Sequel::Database.new
-    @d.meta_def(:tables){[:t1, :t2]}
+    @d.meta_def(:tables){|o| [:t1, :t2]}
     @d.meta_def(:schema) do |t, *o|
       case t
       when :t1
@@ -80,12 +80,18 @@ describe "Sequel::Database dump methods" do
          [:c2, {:db_type=>'datetime', :allow_null=>false}]]
       when :t5
         [[:c1, {:db_type=>'blahblah', :allow_null=>true}]]
+      when :t6
+        [[:c1, {:db_type=>'bigint', :primary_key=>true, :allow_null=>true}]]
       end
     end
   end
 
   it "should support dumping table schemas as create_table method calls" do
     @d.dump_table_schema(:t1).should == "create_table(:t1) do\n  primary_key :c1\n  String :c2, :size=>20\nend"
+  end
+
+  it "should dump non-Integer primary key columns with explicit :type" do
+    @d.dump_table_schema(:t6).should == "create_table(:t6) do\n  primary_key :c1, :type=>Bignum\nend"
   end
 
   it "should use a composite primary_key calls if there is a composite primary key" do
@@ -125,7 +131,7 @@ END_MIG
   end
 
   it "should sort table names when dumping a migration" do
-    @d.meta_def(:tables){[:t2, :t1]}
+    @d.meta_def(:tables){|o| [:t2, :t1]}
     @d.dump_schema_migration.should == <<-END_MIG
 Class.new(Sequel::Migration) do
   def up
@@ -204,7 +210,7 @@ END_MIG
   end
 
   it "should support dumping just indexes as a migration" do
-    @d.meta_def(:tables){[:t1]}
+    @d.meta_def(:tables){|o| [:t1]}
     @d.meta_def(:indexes) do |t|
       {:i1=>{:columns=>[:c1], :unique=>false},
        :t1_c2_c1_index=>{:columns=>[:c2, :c1], :unique=>true}}
@@ -305,7 +311,7 @@ create_table(:x) do
   String :c26, :fixed=>true
   String :c27, :fixed=>true
   String :c28
-  String :c29
+  String :c29, :size=>255
   String :c30, :size=>30
   String :c31
   String :c32

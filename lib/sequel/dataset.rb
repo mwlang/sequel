@@ -41,7 +41,7 @@ module Sequel
 
     # Which options don't affect the SQL generation.  Used by simple_select_all?
     # to determine if this is a simple SELECT * FROM table.
-    NON_SQL_OPTIONS = [:server, :defaults, :overrides]
+    NON_SQL_OPTIONS = [:server, :defaults, :overrides, :graph, :eager_graph, :graph_aliases]
 
     NOTIMPL_MSG = "This method must be overridden in Sequel adapters".freeze
     WITH_SUPPORTED=:select_with_sql
@@ -118,6 +118,15 @@ module Sequel
       meths.each do |meth|
         instance_eval("def #{meth}!(*args, &block); mutation_method(:#{meth}, *args, &block) end", __FILE__, __LINE__)
       end
+    end
+
+    # Yield a dataset for each server in the connection pool that is tied to that server.
+    # Intended for use in sharded environments where all servers need to be modified
+    # with the same data:
+    #
+    #   DB[:configs].where(:key=>'setting').each_server{|ds| ds.update(:value=>'new_value')}
+    def each_server
+      db.servers.each{|s| yield server(s)}
     end
 
     # Returns a string representation of the dataset including the class name 

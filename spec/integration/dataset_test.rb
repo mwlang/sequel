@@ -715,6 +715,14 @@ describe "Sequel::Dataset DSL support" do
     @ds.exclude(:a=>nil).all.should == [{:a=>20, :b=>nil}]
   end
   
+  it "should work with arrays as hash values" do
+    @ds.insert(20, 10)
+    @ds.filter(:a=>[10]).all.should == []
+    @ds.filter(:a=>[20, 10]).all.should == [{:a=>20, :b=>10}]
+    @ds.exclude(:a=>[10]).all.should == [{:a=>20, :b=>10}]
+    @ds.exclude(:a=>[20, 10]).all.should == []
+  end
+  
   it "should work with ranges as hash values" do
     @ds.insert(20, 10)
     @ds.filter(:a=>(10..30)).all.should == [{:a=>20, :b=>10}]
@@ -733,7 +741,7 @@ describe "Sequel::Dataset DSL support" do
     @ds.filter({15=>20}.case(0, :a) > 0).all.should == []
   end
   
-  it "should work multiple value arrays" do
+  it "should work with multiple value arrays" do
     @ds.insert(20, 10)
     @ds.quote_identifiers = false
     @ds.filter([:a, :b]=>[[20, 10]].sql_array).all.should == [{:a=>20, :b=>10}]
@@ -745,6 +753,41 @@ describe "Sequel::Dataset DSL support" do
     @ds.exclude([:a, :b]=>[[10, 20]].sql_array).all.should == [{:a=>20, :b=>10}]
     @ds.exclude([:a, :b]=>[[20, 10], [1, 2]].sql_array).all.should == []
     @ds.exclude([:a, :b]=>[[10, 10], [20, 20]].sql_array).all.should == [{:a=>20, :b=>10}]
+  end
+
+  it "should work with IN/NOT in with datasets" do
+    @ds.insert(20, 10)
+    ds = @ds.unordered
+    @ds.quote_identifiers = false
+
+    @ds.filter(:a=>ds.select(:a)).all.should == [{:a=>20, :b=>10}]
+    @ds.filter(:a=>ds.select(:a).where(:a=>15)).all.should == []
+    @ds.exclude(:a=>ds.select(:a)).all.should == []
+    @ds.exclude(:a=>ds.select(:a).where(:a=>15)).all.should == [{:a=>20, :b=>10}]
+
+    @ds.filter([:a, :b]=>ds.select(:a, :b)).all.should == [{:a=>20, :b=>10}]
+    @ds.filter([:a, :b]=>ds.select(:b, :a)).all.should == []
+    @ds.exclude([:a, :b]=>ds.select(:a, :b)).all.should == []
+    @ds.exclude([:a, :b]=>ds.select(:b, :a)).all.should == [{:a=>20, :b=>10}]
+
+    @ds.filter([:a, :b]=>ds.select(:a, :b).where(:a=>15)).all.should == []
+    @ds.exclude([:a, :b]=>ds.select(:a, :b).where(:a=>15)).all.should == [{:a=>20, :b=>10}]
+  end
+
+  specify "should work empty arrays" do
+    @ds.insert(20, 10)
+    @ds.filter(:a=>[]).all.should == []
+    @ds.exclude(:a=>[]).all.should == [{:a=>20, :b=>10}]
+    @ds.filter([:a, :b]=>[]).all.should == []
+    @ds.exclude([:a, :b]=>[]).all.should == [{:a=>20, :b=>10}]
+  end
+  
+  specify "should work empty arrays with nulls" do
+    @ds.insert(nil, nil)
+    @ds.filter(:a=>[]).all.should == []
+    @ds.exclude(:a=>[]).all.should == [{:a=>nil, :b=>nil}]
+    @ds.filter([:a, :b]=>[]).all.should == []
+    @ds.exclude([:a, :b]=>[]).all.should == [{:a=>nil, :b=>nil}]
   end
   
   it "should work multiple conditions" do
@@ -868,5 +911,42 @@ describe "Dataset defaults and overrides" do
     @ds.insert
     @ds.insert(:a=>20)
     @ds.all.should == [{:a=>10}, {:a=>10}]
+  end
+end
+
+if INTEGRATION_DB.dataset.supports_modifying_joins?
+  describe "Modifying joined datasets" do
+    before do
+      @db = INTEGRATION_DB
+      @db.create_table!(:a){Integer :a; Integer :d}
+      @db.create_table!(:b){Integer :b; Integer :e}
+      @db.create_table!(:c){Integer :c; Integer :f}
+      @ds = @db.from(:a, :b).join(:c, :c=>:e.identifier).where(:d=>:b, :f=>6)
+      @db[:a].insert(1, 2)
+      @db[:a].insert(3, 4)
+      @db[:b].insert(2, 5)
+      @db[:c].insert(5, 6)
+      @db[:b].insert(4, 7)
+      @db[:c].insert(7, 8)
+    end
+    after do
+      @db.drop_table(:a, :b, :c)
+    end
+    
+    it "#update should allow updating joined datasets" do
+      @ds.update(:a=>10)
+      @ds.all.should == [{:c=>5, :b=>2, :a=>10, :d=>2, :e=>5, :f=>6}]
+      @db[:a].order(:a).all.should == [{:a=>3, :d=>4}, {:a=>10, :d=>2}]
+      @db[:b].order(:b).all.should == [{:b=>2, :e=>5}, {:b=>4, :e=>7}]
+      @db[:c].order(:c).all.should == [{:c=>5, :f=>6}, {:c=>7, :f=>8}]
+    end
+    
+    it "#delete should allow deleting from joined datasets" do
+      @ds.delete
+      @ds.all.should == []
+      @db[:a].order(:a).all.should == [{:a=>3, :d=>4}]
+      @db[:b].order(:b).all.should == [{:b=>2, :e=>5}, {:b=>4, :e=>7}]
+      @db[:c].order(:c).all.should == [{:c=>5, :f=>6}, {:c=>7, :f=>8}]
+    end
   end
 end

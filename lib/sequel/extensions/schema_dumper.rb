@@ -11,7 +11,7 @@ module Sequel
     # * :same_db - Create a dump for the same database type, so
     #   don't ignore errors if the index statements fail.
     def dump_indexes_migration(options={})
-      ts = tables
+      ts = tables(options)
       <<END_MIG
 Class.new(Sequel::Migration) do
   def up
@@ -35,7 +35,7 @@ END_MIG
     # * :indexes - If set to false, don't dump indexes (they can be added
     #   later via dump_index_migration).
     def dump_schema_migration(options={})
-      ts = tables
+      ts = tables(options)
       <<END_MIG
 Class.new(Sequel::Migration) do
   def up
@@ -86,7 +86,12 @@ END_MIG
     # name and arguments to it to pass to a Schema::Generator to recreate the column.
     def column_schema_to_generator_opts(name, schema, options)
       if options[:single_pk] && schema_autoincrementing_primary_key?(schema)
-        [:primary_key, name]
+        type_hash = column_schema_to_ruby_type(schema)
+        if type_hash == {:type=>Integer}
+          [:primary_key, name]
+        else
+          [:primary_key, name, type_hash]
+        end
       else
         col_opts = options[:same_db] ? {:type=>schema[:db_type]} : column_schema_to_ruby_type(schema)
         type = col_opts.delete(:type)
@@ -130,8 +135,7 @@ END_MIG
       when /\An?char(?:acter)?(?:\((\d+)\))?\z/o
         {:type=>String, :size=>($1.to_i if $1), :fixed=>true}
       when /\A(?:n?varchar|character varying|bpchar|string)(?:\((\d+)\))?\z/o
-        s = ($1.to_i if $1)
-        {:type=>String, :size=>(s == 255 ? nil : s)}
+        {:type=>String, :size=>($1.to_i if $1)}
       when /\A(?:small)?money\z/o
         {:type=>BigDecimal, :size=>[19,2]}
       when /\A(?:decimal|numeric|number)(?:\((\d+)(?:,\s*(\d+))?\))?\z/o

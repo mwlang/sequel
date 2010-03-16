@@ -100,7 +100,7 @@ module Sequel
       # Also, force the max connections to 1 if a memory database is being
       # used, as otherwise each connection gets a separate database.
       def connection_pool_default_options
-        o = super.merge(:pool_convert_exceptions=>false)
+        o = super.dup
         # Default to only a single connection if a memory database is used,
         # because otherwise each connection will get a separate database
         o[:max_connections] = 1 if @opts[:database] == ':memory:' || blank_object?(@opts[:database])
@@ -192,6 +192,7 @@ module Sequel
         ps = to_prepared_statement(type, values)
         ps.extend(PreparedStatementMethods)
         db.prepared_statements[name] = ps if name
+        ps.prepared_sql
         ps
       end
       

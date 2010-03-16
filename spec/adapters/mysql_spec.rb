@@ -62,11 +62,26 @@ context "MySQL", '#create_table' do
     @db.create_table(:dolls){File :name, :default=>'blah'}
     @db.sqls.should == ["CREATE TABLE dolls (name blob)"]
   end
+  
+  specify "should respect the size option for File type" do
+    @db.create_table(:dolls) do
+      File :n1
+      File :n2, :size=>:tiny
+      File :n3, :size=>:medium
+      File :n4, :size=>:long
+      File :n5, :size=>255
+    end
+    @db.schema(:dolls).map{|k, v| v[:db_type]}.should == %w"blob tinyblob mediumblob longblob blob"
+  end
 end
 
 context "A MySQL database" do
   specify "should provide the server version" do
     MYSQL_DB.server_version.should >= 40000
+  end
+  
+  specify "should handle the creation and dropping of an InnoDB table with foreign keys" do
+    proc{MYSQL_DB.create_table!(:test_innodb, :engine=>:InnoDB){primary_key :id; foreign_key :fk, :test_innodb, :key=>:id}}.should_not raise_error
   end
 end
 
@@ -940,6 +955,17 @@ if MYSQL_DB.class.adapter_scheme == :mysql
     
     specify "should combine all results by default" do
       @ds.all.should == [{:a=>10}, {:a=>15}, {:b=>20}, {:b=>25}]
+    end
+    
+    specify "should work with Database#run" do
+      proc{MYSQL_DB.run('SELECT * FROM a; SELECT * FROM b')}.should_not raise_error
+      proc{MYSQL_DB.run('SELECT * FROM a; SELECT * FROM b')}.should_not raise_error
+    end
+    
+    specify "should work with Database#run and other statements" do
+      proc{MYSQL_DB.run('UPDATE a SET a = 1; SELECT * FROM a; DELETE FROM b')}.should_not raise_error
+      MYSQL_DB[:a].select_order_map(:a).should == [1, 1]
+      MYSQL_DB[:b].all.should == []
     end
     
     specify "should split results returned into arrays if split_multiple_result_sets is used" do

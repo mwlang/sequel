@@ -101,10 +101,29 @@ module Sequel
         # H2 doesn't support JOIN USING
         def supports_join_using?
           false
+        end
+        
+        # H2 doesn't support multiple columns in IN/NOT IN
+        def supports_multiple_column_in?
+          false
         end 
 
         private
       
+        # H2 expects hexadecimal strings for blob values
+        def literal_blob(v)
+          literal_string v.unpack("H*").first
+        end
+        
+        def convert_type(v)
+          case v
+          when Java::OrgH2Jdbc::JdbcClob
+            convert_type(v.getSubString(1, v.length))
+          else
+            super(v)
+          end
+        end
+        
         def select_clause_methods
           SELECT_CLAUSE_METHODS
         end

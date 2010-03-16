@@ -1,5 +1,7 @@
 require File.join(File.dirname(__FILE__), 'spec_helper.rb')
 
+require ENV['SEQUEL_MSSQL_SPEC_REQUIRE'] if ENV['SEQUEL_MSSQL_SPEC_REQUIRE']
+
 unless defined?(MSSQL_DB)
   MSSQL_URL = 'jdbc:sqlserver://localhost;integratedSecurity=true;database=sandbox' unless defined? MSSQL_URL
   MSSQL_DB = Sequel.connect(ENV['SEQUEL_MSSQL_SPEC_DB']||MSSQL_URL)
@@ -332,9 +334,13 @@ context "MSSSQL::Dataset#insert" do
   specify "should have insert_select return nil if disable_insert_output is used" do
     @ds.disable_insert_output.insert_select(:value=>10).should == nil
   end
+  
+  specify "should have insert_select return nil if the server version is not 2005+" do
+    @ds.meta_def(:server_version){8000760}
+    @ds.insert_select(:value=>10).should == nil
+  end
 
   specify "should have insert_select insert the record and return the inserted record" do
-    @ds.meta_def(:server_version){80201}
     h = @ds.insert_select(:value=>10)
     h[:value].should == 10
     @ds.first(:xid=>h[:xid])[:value].should == 10
@@ -344,5 +350,24 @@ end
 context "MSSSQL::Dataset#disable_insert_output" do
   specify "should play nicely with simple_select_all?" do
     MSSQL_DB[:test].disable_insert_output.send(:simple_select_all?).should == true
+  end
+end
+
+context "MSSSQL::Dataset#into" do
+  before do
+    @db = MSSQL_DB
+  end
+
+  specify "should format SELECT statement" do
+    @db[:t].into(:new).select_sql.should == "SELECT * INTO NEW FROM T"
+  end
+
+  specify "should select rows into a new table" do
+    @db.create_table!(:t) {Integer :id; String :value}
+    @db[:t].insert(:id => 1, :value => "test")
+    @db << @db[:t].into(:new).select_sql
+    @db[:new].all.should == [{:id => 1, :value => "test"}]
+    @db.drop_table(:t)
+    @db.drop_table(:new)
   end
 end

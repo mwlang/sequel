@@ -18,8 +18,8 @@ module Sequel
     #   attribute(s) to validate.
     # Options:
     # * :allow_blank - Whether to skip the validation if the value is blank.  You should
-    #   make sure all objects respond to blank if you use this option, which you can do by
-    #   requiring 'sequel/extensions/blank'
+    #   make sure all objects respond to blank if you use this option, which you can do by:
+    #     Sequel.extension :blank
     # * :allow_missing - Whether to skip the validation if the attribute isn't a key in the
     #   values hash.  This is different from allow_nil, because Sequel only sends the attributes
     #   in the values when doing an insert or update.  If the attribute is not present, Sequel
@@ -54,6 +54,7 @@ module Sequel
         :min_length=>{:message=>lambda{|min| "is shorter than #{min} characters"}},
         :not_string=>{:message=>lambda{|type| type ? "is not a valid #{type}" : "is a string"}},
         :numeric=>{:message=>lambda{"is not a number"}},
+        :type=>{:message=>lambda{|klass| "is not a #{klass}"}},
         :presence=>{:message=>lambda{"is not present"}},
         :unique=>{:message=>lambda{'is already taken'}}
       }
@@ -110,7 +111,7 @@ module Sequel
         def validates_not_string(atts, opts={})
           validatable_attributes_for_type(:not_string, atts, opts){|a,v,m| validation_error_message(m, (db_schema[a]||{})[:type]) if v.is_a?(String)}
         end
-    
+
         # Check attribute value(s) string representation is a valid float.
         def validates_numeric(atts, opts={})
           validatable_attributes_for_type(:numeric, atts, opts) do |a,v,m|
@@ -121,6 +122,12 @@ module Sequel
               validation_error_message(m)
             end
           end
+        end
+
+        # Check if value is an instance of a class
+        def validates_type(klass, atts, opts={})
+          klass = klass.to_s.constantize if klass.is_a?(String) || klass.is_a?(Symbol)
+          validatable_attributes_for_type(:type, atts, opts){|a,v,m| validation_error_message(m, klass) if v && !v.is_a?(klass)}
         end
     
         # Check attribute value(s) is not considered blank by the database, but allow false values.
@@ -153,6 +160,8 @@ module Sequel
         #
         # Possible Options:
         # * :message - The message to use (default: 'is already taken')
+        # * :only_if_modified - Only check the uniqueness if the object is new or
+        #   one of the columns has been modified.
         def validates_unique(*atts)
           opts = default_validation_helpers_options(:unique)
           if atts.last.is_a?(Hash)
@@ -160,9 +169,12 @@ module Sequel
           end
           message = validation_error_message(opts[:message])
           atts.each do |a|
-            ds = model.filter(Array(a).map{|x| [x, send(x)]})
+            arr = Array(a)
+            next if opts[:only_if_modified] && !new? && !arr.any?{|x| changed_columns.include?(x)}
+            ds = model.filter(arr.map{|x| [x, send(x)]})
             ds = yield(ds) if block_given?
-            errors.add(a, message) unless (new? ? ds : ds.exclude(pk_hash)).count == 0
+            ds = ds.exclude(pk_hash) unless new?
+            errors.add(a, message) unless ds.count == 0
           end
         end
         

@@ -461,7 +461,7 @@ module Sequel
         #     before a new item is added to the association.
         #   - :before_remove - Symbol, Proc, or array of both/either specifying a callback to call
         #     before an item is removed from the association.
-        #   - :cartesian_product_number - he number of joins completed by this association that could cause more
+        #   - :cartesian_product_number - the number of joins completed by this association that could cause more
         #     than one row for each row in the current table (default: 0 for many_to_one associations,
         #     1 for *_to_many associations).
         #   - :class - The associated class or its name. If not
@@ -763,7 +763,7 @@ module Sequel
           jt_join_type = opts[:graph_join_table_join_type]
           jt_graph_block = opts[:graph_join_table_block]
           opts[:eager_grapher] ||= proc do |ds, assoc_alias, table_alias|
-            ds = ds.graph(join_table, use_jt_only_conditions ? jt_only_conditions : lcks.zip(lcpks) + graph_jt_conds, :select=>false, :table_alias=>ds.send(:eager_unique_table_alias, ds, join_table), :join_type=>jt_join_type, :implicit_qualifier=>table_alias, :from_self_alias=>ds.opts[:eager_graph][:master], &jt_graph_block)
+            ds = ds.graph(join_table, use_jt_only_conditions ? jt_only_conditions : lcks.zip(lcpks) + graph_jt_conds, :select=>false, :table_alias=>ds.unused_table_alias(join_table), :join_type=>jt_join_type, :implicit_qualifier=>table_alias, :from_self_alias=>ds.opts[:eager_graph][:master], &jt_graph_block)
             ds.graph(opts.associated_class, use_only_conditions ? only_conditions : opts.right_primary_keys.zip(rcks) + conditions, :select=>select, :table_alias=>assoc_alias, :join_type=>join_type, &graph_block)
           end
       
@@ -1213,8 +1213,6 @@ module Sequel
         # Like eager, you need to call .all on the dataset for the eager loading to work.  If you just
         # call each, you will get a normal graphed result back (a hash with model object values).
         def eager_graph(*associations)
-          table_name = model.table_name
-            
           ds = if @opts[:eager_graph]
             self
           else
@@ -1223,9 +1221,9 @@ module Sequel
             # :requirements - array of requirements for this association
             # :alias_association_type_map - the type of association for this association
             # :alias_association_name_map - the name of the association for this association
-            clone(:eager_graph=>{:requirements=>{}, :master=>table_name, :alias_association_type_map=>{}, :alias_association_name_map=>{}, :reciprocals=>{}, :cartesian_product_number=>0})
+            clone(:eager_graph=>{:requirements=>{}, :master=>alias_symbol(first_source), :alias_association_type_map=>{}, :alias_association_name_map=>{}, :reciprocals=>{}, :cartesian_product_number=>0})
           end
-          ds.eager_graph_associations(ds, model, table_name, [], *associations)
+          ds.eager_graph_associations(ds, model, ds.opts[:eager_graph][:master], [], *associations)
         end
         
         # Do not attempt to split the result set into associations,
@@ -1253,9 +1251,9 @@ module Sequel
         def eager_graph_association(ds, model, ta, requirements, r, *associations)
           klass = r.associated_class
           assoc_name = r[:name]
-          assoc_table_alias = ds.eager_unique_table_alias(ds, assoc_name)
+          assoc_table_alias = ds.unused_table_alias(assoc_name)
           ds = r[:eager_grapher].call(ds, assoc_table_alias, ta)
-          ds = ds.order_more(*Array(r[:order]).map{|c| eager_graph_qualify_order(assoc_table_alias, c)}) if r[:order] and r[:order_eager_graph]
+          ds = ds.order_more(*qualified_expression(r[:order], assoc_table_alias)) if r[:order] and r[:order_eager_graph]
           eager_graph = ds.opts[:eager_graph]
           eager_graph[:requirements][assoc_table_alias] = requirements.dup
           eager_graph[:alias_association_name_map][assoc_table_alias] = assoc_name
@@ -1354,30 +1352,11 @@ module Sequel
           record_graphs.replace(records)
         end
       
-        # Creates a unique table alias that hasn't already been used in the query.
-        # Will either be the table_alias itself or table_alias_N for some integer
-        # N (starting at 0 and increasing until an unused one is found).
-        def eager_unique_table_alias(ds, table_alias)
-          used_aliases = ds.opts[:from]
-          used_aliases += ds.opts[:join].map{|j| j.table_alias || j.table} if ds.opts[:join]
-          graph = ds.opts[:graph]
-          used_aliases += graph[:table_aliases].keys if graph
-          if used_aliases.include?(table_alias)
-            i = 0
-            loop do
-              ta = :"#{table_alias}_#{i}"
-              return ta unless used_aliases.include?(ta)
-              i += 1
-            end
-          end
-          table_alias
-        end
-
         private
       
         # Make sure the association is valid for this model, and return the related AssociationReflection.
         def check_association(model, association)
-          raise(Sequel::Error, 'Invalid association') unless reflection = model.association_reflection(association)
+          raise(Sequel::Error, "Invalid association #{association} for #{model.name}") unless reflection = model.association_reflection(association)
           raise(Sequel::Error, "Eager loading is not allowed for #{model.name} association #{association}") if reflection[:allow_eager] == false
           reflection
         end
@@ -1430,23 +1409,6 @@ module Sequel
               # Recurse into dependencies
               eager_graph_make_associations_unique(list, deps, alias_map, type_map) if list
             end
-          end
-        end
-      
-        # Qualify the given expression if necessary.  The only expressions which are qualified are
-        # unqualified symbols and identifiers, either of which may by sorted.
-        def eager_graph_qualify_order(table_alias, expression)
-          case expression
-          when Symbol
-            table, column, aliaz = split_symbol(expression)
-            raise(Sequel::Error, "Can't use an aliased expression in the :order option") if aliaz
-            table ? expression : Sequel::SQL::QualifiedIdentifier.new(table_alias, expression)
-          when Sequel::SQL::Identifier
-            Sequel::SQL::QualifiedIdentifier.new(table_alias, expression)
-          when Sequel::SQL::OrderedExpression
-            Sequel::SQL::OrderedExpression.new(eager_graph_qualify_order(table_alias, expression.expression), expression.descending)
-          else
-            expression
           end
         end
       

@@ -36,6 +36,16 @@ module Sequel
 
     # Base class for all SQL fragments
     class Expression
+      # all instance variables declared to be readers are to be used for comparison.
+      def self.attr_reader(*args)
+        super
+        comparison_attrs.concat args
+      end
+
+      def self.comparison_attrs
+        @comparison_attrs ||= self == Expression ? [] : superclass.comparison_attrs.clone
+      end
+
       # Create a to_s instance method that takes a dataset, and calls
       # the method provided on the dataset with args as the argument (self by default).
       # Used to DRY up some code.
@@ -54,6 +64,13 @@ module Sequel
       def sql_literal(ds)
         to_s(ds)
       end
+
+      # Returns true if the receiver is the same expression as the
+      # the +other+ expression.
+      def eql?(other)
+        other.is_a?(self.class) && !self.class.comparison_attrs.find {|a| send(a) != other.send(a)}
+      end
+      alias == eql?
     end
 
     # Represents a complex SQL expression, with a given operator and one
@@ -74,10 +91,10 @@ module Sequel
         :'!~*' => :'~*', :NOT => :NOOP, :NOOP => :NOT, :ILIKE => :'NOT ILIKE',
         :'NOT ILIKE'=>:ILIKE}
 
-      # Mathematical Operators used in NumericMethods
+      # Standard Mathematical Operators used in NumericMethods
       MATHEMATICAL_OPERATORS = [:+, :-, :/, :*]
 
-      # Mathematical Operators used in NumericMethods
+      # Bitwise Mathematical Operators used in NumericMethods
       BITWISE_OPERATORS = [:&, :|, :^, :<<, :>>]
 
       # Inequality Operators used in InequalityMethods
@@ -125,13 +142,6 @@ module Sequel
         @op = op
         @args = args
       end
-
-      # Returns true if the receiver is the same expression as the
-      # the +other+ expression.
-      def eql?(other)
-        other.is_a?(self.class) && @op.eql?(other.op) && @args.eql?(other.args)
-      end
-      alias == eql?
       
       to_s_method :complex_expression_sql, '@op, @args'
     end
@@ -350,7 +360,7 @@ module Sequel
     # and SQL::StringExpression).
     #
     # This defines the like (LIKE) and ilike methods, used for pattern matching.
-    # like is case sensitive, ilike is case insensitive.
+    # like is case sensitive (if the database supports it), ilike is case insensitive.
     module StringMethods
       # Create a BooleanExpression case insensitive pattern match of self
       # with the given patterns.  See StringExpression.like.
@@ -358,7 +368,7 @@ module Sequel
         StringExpression.like(self, *(ces << {:case_insensitive=>true}))
       end
 
-      # Create a BooleanExpression case sensitive pattern match of self with
+      # Create a BooleanExpression case sensitive (if the database supports it) pattern match of self with
       # the given patterns.  See StringExpression.like.
       def like(*ces)
         StringExpression.like(self, *ces)
@@ -446,6 +456,10 @@ module Sequel
             new(:AND, new(:>=, l, r.begin), new(r.exclude_end? ? :< : :<=, l, r.end))
           when Array, ::Sequel::Dataset, SQLArray
             new(:IN, l, r)
+          when NegativeBooleanConstant
+            new(:"IS NOT", l, r.constant)
+          when BooleanConstant
+            new(:IS, l, r.constant)
           when NilClass, TrueClass, FalseClass
             new(:IS, l, r)
           when Regexp
@@ -544,7 +558,7 @@ module Sequel
       include SubscriptMethods
     end
 
-    # Represents constants or psuedo-constants (e.g. CURRENT_DATE) in SQL
+    # Represents constants or psuedo-constants (e.g. CURRENT_DATE) in SQL.
     class Constant < GenericExpression
       # Create an object with the given table
       def initialize(constant)
@@ -552,6 +566,20 @@ module Sequel
       end
       
       to_s_method :constant_sql, '@constant'
+    end
+
+    # Represents boolean constants such as NULL, NOTNULL, TRUE, and FALSE.
+    class BooleanConstant < Constant
+      # The underlying constant related for this object.
+      attr_reader :constant
+
+      to_s_method :boolean_constant_sql, '@constant'
+    end
+    
+    # Represents inverse boolean constants (currently only NOTNULL). A
+    # special class to allow for special behavior.
+    class NegativeBooleanConstant < BooleanConstant
+      to_s_method :negative_boolean_constant_sql, '@constant'
     end
     
     # Holds default generic constants that can be referenced.  These
@@ -562,6 +590,10 @@ module Sequel
       CURRENT_DATE = Constant.new(:CURRENT_DATE)
       CURRENT_TIME = Constant.new(:CURRENT_TIME)
       CURRENT_TIMESTAMP = Constant.new(:CURRENT_TIMESTAMP)
+      SQLTRUE = TRUE = BooleanConstant.new(true)
+      SQLFALSE = FALSE = BooleanConstant.new(false)
+      NULL = BooleanConstant.new(nil)
+      NOTNULL = NegativeBooleanConstant.new(nil)
     end
 
     # Represents an SQL function call.

@@ -565,3 +565,29 @@ context "Model.db_schema" do
     @c.primary_key.should == :id
   end
 end
+
+context "Model#use_transactions" do
+  before do
+    @c = Class.new(Sequel::Model(:items))
+  end
+
+  specify "should return class value by default" do
+    @c.use_transactions = true
+    @c.new.use_transactions.should == true
+    @c.use_transactions = false
+    @c.new.use_transactions.should == false
+  end
+
+  specify "should return set value if manually set" do
+    instance = @c.new
+    instance.use_transactions = false
+    instance.use_transactions.should == false
+    @c.use_transactions = true
+    instance.use_transactions.should == false
+    
+    instance.use_transactions = true
+    instance.use_transactions.should == true
+    @c.use_transactions = false
+    instance.use_transactions.should == true
+  end
+end

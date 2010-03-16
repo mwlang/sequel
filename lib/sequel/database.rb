@@ -80,20 +80,22 @@ module Sequel
     # is given, it is used as the connection_proc for the ConnectionPool.
     def initialize(opts = {}, &block)
       @opts ||= opts
+      @opts = connection_pool_default_options.merge(@opts)
+      @loggers = Array(@opts[:logger]) + Array(@opts[:loggers])
+      @opts[:disconnection_proc] ||= proc{|conn| disconnect_connection(conn)}
+      block ||= proc{|server| connect(server)}
+      @opts[:servers] = {} if @opts[:servers].is_a?(String)
       
-      @single_threaded = opts.include?(:single_threaded) ? typecast_value_boolean(opts[:single_threaded]) : @@single_threaded
+      @opts[:single_threaded] = @single_threaded = @opts.include?(:single_threaded) ? typecast_value_boolean(@opts[:single_threaded]) : @@single_threaded
       @schemas = {}
-      @default_schema = opts.include?(:default_schema) ? opts[:default_schema] : default_schema_default
+      @default_schema = opts.include?(:default_schema) ? @opts[:default_schema] : default_schema_default
       @prepared_statements = {}
       @transactions = []
       @identifier_input_method = nil
       @identifier_output_method = nil
       @quote_identifiers = nil
-      @pool = (@single_threaded ? SingleThreadedPool : ConnectionPool).new(connection_pool_default_options.merge(opts), &block)
-      @pool.connection_proc = proc{|server| connect(server)} unless block
-      @pool.disconnection_proc = proc{|conn| disconnect_connection(conn)} unless opts[:disconnection_proc]
+      @pool = ConnectionPool.get_pool(@opts, &block)
 
-      @loggers = Array(opts[:logger]) + Array(opts[:loggers])
       ::Sequel::DATABASES.push(self)
     end
     
@@ -108,7 +110,7 @@ module Sequel
       unless klass = ADAPTER_MAP[scheme]
         # attempt to load the adapter file
         begin
-          Sequel.require "adapters/#{scheme}"
+          Sequel.tsk_require "sequel/adapters/#{scheme}"
         rescue LoadError => e
           raise Sequel.convert_exception_class(e, AdapterNotFound)
         end
@@ -139,7 +141,7 @@ module Sequel
           scheme = :dbi if scheme =~ /\Adbi-/
           c = adapter_class(scheme)
           uri_options = c.send(:uri_to_options, uri)
-          uri.query.split('&').collect{|s| s.split('=')}.each{|k,v| uri_options[k.to_sym] = v} unless uri.query.to_s.strip.empty?
+          uri.query.split('&').collect{|s| s.split('=')}.each{|k,v| uri_options[k.to_sym] = v if k && !k.empty?} unless uri.query.to_s.strip.empty?
           uri_options.entries.each{|k,v| uri_options[k] = URI.unescape(v) if v.is_a?(String)}
           opts = uri_options.merge(opts)
         end
@@ -255,6 +257,20 @@ module Sequel
       (String === args.first) ? fetch(*args) : from(*args)
     end
     
+    # Dynamically add new servers or modify server options at runtime. Also adds new
+    # servers to the connection pool. Intended for use with master/slave or shard
+    # configurations where it is useful to add new server hosts at runtime.
+    #
+    # servers argument should be a hash with server name symbol keys and hash or
+    # proc values.  If a servers key is already in use, it's value is overridden
+    # with the value provided.
+    #
+    #  DB.add_servers(:f=>{:host=>"hash_host_f"})
+    def add_servers(servers)
+      @opts[:servers] = @opts[:servers] ? @opts[:servers].merge(servers) : servers
+      @pool.add_servers(servers.keys)
+    end
+    
     # Call the prepared statement with the given name with the given hash
     # of arguments.
     def call(ps_name, hash={})
@@ -267,7 +283,7 @@ module Sequel
     end
 
     # Connects to the database. This method should be overridden by descendants.
-    def connect
+    def connect(server)
       raise NotImplementedError, "#connect should be overridden by adapters"
     end
     
@@ -288,9 +304,20 @@ module Sequel
     end
     
     # Disconnects all available connections from the connection pool.  Any
-    # connections currently in use will not be disconnected.
-    def disconnect
-      pool.disconnect
+    # connections currently in use will not be disconnected. Options:
+    # * :servers - Should be a symbol specifing the server to disconnect from,
+    #   or an array of symbols to specify multiple servers.
+    def disconnect(opts = {})
+      pool.disconnect(opts)
+    end
+
+    # Yield a new database object for every server in the connection pool.
+    # Intended for use in sharded environments where there is a need to make schema
+    # modifications (DDL queries) on each shard.
+    #
+    #   DB.each_server{|db| db.create_table(:users){primary_key :id; String :name}}
+    def each_server(&block)
+      servers.each{|s| self.class.connect(server_opts(s), &block)}
     end
 
     # Executes the given SQL on the database. This method should be overridden in descendants.
@@ -431,17 +458,32 @@ module Sequel
       @quote_identifiers = @opts.include?(:quote_identifiers) ? @opts[:quote_identifiers] : (@@quote_identifiers.nil? ? quote_identifiers_default : @@quote_identifiers)
     end
     
+    # Dynamically remove existing servers from the connection pool. Intended for
+    # use with master/slave or shard configurations where it is useful to remove
+    # existing server hosts at runtime.
+    #
+    # servers should be symbols or arrays of symbols.  If a nonexistent server
+    # is specified, it is ignored.  If no servers have been specified for
+    # this database, no changes are made. If you attempt to remove the :default server,
+    # an error will be raised.
+    #
+    #   DB.remove_servers(:f1, :f2)
+    def remove_servers(*servers)
+      if @opts[:servers] && !@opts[:servers].empty?
+        servs = @opts[:servers].dup
+        servers.flatten!
+        servers.each{|s| servs.delete(s)}
+        @opts[:servers] = servs
+        @pool.remove_servers(servers)
+      end
+    end
+    
     # Runs the supplied SQL statement string on the database server. Returns nil.
     # Options:
     # * :server - The server to run the SQL on.
     def run(sql, opts={})
       execute_ddl(sql, opts)
       nil
-    end
-    
-    # Returns a new dataset with the select method invoked.
-    def select(*args, &block)
-      dataset.select(*args, &block)
     end
     
     # Parse the schema from the database.
@@ -472,6 +514,16 @@ module Sequel
       @schemas[quoted_name] = cols
     end
 
+    # Returns a new dataset with the select method invoked.
+    def select(*args, &block)
+      dataset.select(*args, &block)
+    end
+
+    # An array of servers/shards for this Database object.
+    def servers
+      pool.servers
+    end
+
     # Returns true if the database is using a single-threaded connection pool.
     def single_threaded?
       @single_threaded
@@ -488,8 +540,7 @@ module Sequel
     end
 
     # Returns true if a table with the given name exists.  This requires a query
-    # to the database unless this database object already has the schema for
-    # the given table name.
+    # to the database.
     def table_exists?(name)
       begin 
         from(name).first
@@ -905,7 +956,7 @@ module Sequel
       opts.delete(:servers)
       opts
     end
-
+    
     # Raise a database error unless the exception is an Rollback.
     def transaction_error(e)
       raise_error(e, :classes=>database_error_classes) unless e.is_a?(Rollback)
@@ -996,4 +1047,3 @@ module Sequel
     end
   end
 end
-

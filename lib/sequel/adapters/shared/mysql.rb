@@ -4,8 +4,17 @@ module Sequel
 
   module MySQL
     class << self
-      # Set the default options used for CREATE TABLE
-      attr_accessor :default_charset, :default_collate, :default_engine
+      # Set the default charset used for CREATE TABLE.  You can pass the
+      # :charset option to create_table to override this setting.
+      attr_accessor :default_charset
+
+      # Set the default collation used for CREATE TABLE.  You can pass the
+      # :collate option to create_table to override this setting.
+      attr_accessor :default_collate
+
+      # Set the default engine used for CREATE TABLE.  You can pass the
+      # :engine option to create_table to override this setting.
+      attr_accessor :default_engine
     end
 
     # Methods shared by Database instances that connect to MySQL,
@@ -120,16 +129,16 @@ module Sequel
         super
       end
       
-      # MySQL doesn't handle references as column constraints, it must use a separate table constraint
-      def column_references_column_constraint_sql(column)
-        "#{", FOREIGN KEY (#{quote_identifier(column[:name])})" unless column[:type] == :check}#{column_references_sql(column)}"
-      end
-      
       # Use MySQL specific syntax for engine type and character encoding
       def create_table_sql(name, generator, options = {})
         engine = options.include?(:engine) ? options[:engine] : Sequel::MySQL.default_engine
         charset = options.include?(:charset) ? options[:charset] : Sequel::MySQL.default_charset
         collate = options.include?(:collate) ? options[:collate] : Sequel::MySQL.default_collate
+        generator.columns.each do |c|
+          if t = c.delete(:table)
+            generator.foreign_key([c[:name]], t, c.merge(:name=>nil, :type=>:foreign_key))
+          end
+        end
         "#{super}#{" ENGINE=#{engine}" if engine}#{" DEFAULT CHARSET=#{charset}" if charset}#{" DEFAULT COLLATE=#{collate}" if collate}"
       end
 
@@ -176,6 +185,22 @@ module Sequel
           row[:db_type] = row.delete(:Type)
           row[:type] = schema_column_type(row[:db_type])
           [m.call(row.delete(:Field)), row]
+        end
+      end
+
+      # Respect the :size option if given to produce
+      # tinyblob, mediumblob, and longblob if :tiny,
+      # :medium, or :long is given.
+      def type_literal_generic_file(column)
+        case column[:size]
+        when :tiny    # < 2^8 bytes
+          :tinyblob
+        when :medium  # < 2^24 bytes
+          :mediumblob
+        when :long    # < 2^32 bytes
+          :longblob
+        else          # 2^16 bytes
+          :blob
         end
       end
 
@@ -327,6 +352,11 @@ module Sequel
         false
       end
       
+      # MySQL supports modifying joined datasets
+      def supports_modifying_joins?
+        true
+      end
+
       # MySQL does support fractional timestamps in literal timestamps, but it
       # ignores them.  Also, using them seems to cause problems on 1.9.  Since
       # they are ignored anyway, not using them is probably best.
@@ -346,6 +376,17 @@ module Sequel
       # MySQL supports the ORDER BY and LIMIT clauses for DELETE statements
       def delete_clause_methods
         DELETE_CLAUSE_METHODS
+      end
+      
+      # Consider the first table in the joined dataset is the table to delete
+      # from, but include the others for the purposes of selecting rows.
+      def delete_from_sql(sql)
+        if joined_dataset?
+          sql << " #{source_list(@opts[:from][0..0])} FROM #{source_list(@opts[:from])}"
+          select_join_sql(sql)
+        else
+          super
+        end
       end
 
       # MySQL supports the IGNORE and ON DUPLICATE KEY UPDATE clauses for INSERT statements

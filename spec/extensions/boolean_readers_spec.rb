@@ -8,7 +8,7 @@ describe Sequel::Model, "BooleanReaders plugin" do
     end
 
     @c = Class.new(Sequel::Model(@db[:items]))
-    @p =lambda do
+    @p = proc do
       @columns = [:id, :b, :y]
       def columns; @columns; end
     end
@@ -82,5 +82,11 @@ describe Sequel::Model, "BooleanReaders plugin" do
     o.y.should == nil
     o.y?.should == nil
     proc{o.b?}.should raise_error(NoMethodError)
+  end
+
+  specify "should handle cases where getting the columns raises an error" do
+    @c.meta_def(:columns){raise Sequel::Error}
+    proc{@c.plugin(:boolean_readers)}.should_not raise_error
+    proc{@c.new.b?}.should raise_error(NoMethodError)
   end
 end

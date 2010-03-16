@@ -11,7 +11,8 @@ context "A new Database" do
   end
   
   specify "should receive options" do
-    @db.opts.should == {1 => 2, :logger => 3}  
+    @db.opts[1].should == 2
+    @db.opts[:logger].should == 3  
   end
   
   specify "should set the logger from opts[:logger] and opts[:loggers]" do
@@ -37,17 +38,17 @@ context "A new Database" do
   end
 
   specify "should respect the :single_threaded option" do
-    db = Sequel::Database.new(:single_threaded=>true)
-    db.pool.should be_a_kind_of(Sequel::SingleThreadedPool)
-    db = Sequel::Database.new(:single_threaded=>'t')
-    db.pool.should be_a_kind_of(Sequel::SingleThreadedPool)
-    db = Sequel::Database.new(:single_threaded=>'1')
-    db.pool.should be_a_kind_of(Sequel::SingleThreadedPool)
-    db = Sequel::Database.new(:single_threaded=>false)
+    db = Sequel::Database.new(:single_threaded=>true){123}
+    db.pool.should be_a_kind_of(Sequel::SingleConnectionPool)
+    db = Sequel::Database.new(:single_threaded=>'t'){123}
+    db.pool.should be_a_kind_of(Sequel::SingleConnectionPool)
+    db = Sequel::Database.new(:single_threaded=>'1'){123}
+    db.pool.should be_a_kind_of(Sequel::SingleConnectionPool)
+    db = Sequel::Database.new(:single_threaded=>false){123}
     db.pool.should be_a_kind_of(Sequel::ConnectionPool)
-    db = Sequel::Database.new(:single_threaded=>'f')
+    db = Sequel::Database.new(:single_threaded=>'f'){123}
     db.pool.should be_a_kind_of(Sequel::ConnectionPool)
-    db = Sequel::Database.new(:single_threaded=>'0')
+    db = Sequel::Database.new(:single_threaded=>'0'){123}
     db.pool.should be_a_kind_of(Sequel::ConnectionPool)
   end
 
@@ -191,7 +192,7 @@ context "Database#disconnect" do
   specify "should call pool.disconnect" do
     d = Sequel::Database.new
     p = d.pool
-    p.should_receive(:disconnect).once.and_return(2)
+    p.should_receive(:disconnect).once.with({}).and_return(2)
     d.disconnect.should == 2
   end
 end
@@ -204,7 +205,7 @@ end
 
 context "Database#connect" do
   specify "should raise NotImplementedError" do
-    proc {Sequel::Database.new.connect}.should raise_error(NotImplementedError)
+    proc {Sequel::Database.new.connect(:default)}.should raise_error(NotImplementedError)
   end
 end
 
@@ -315,8 +316,7 @@ end
 
 context "Database#synchronize" do
   before do
-    @db = Sequel::Database.new(:max_connections => 1)
-    @db.pool.connection_proc = proc {12345}
+    @db = Sequel::Database.new(:max_connections => 1){12345}
   end
   
   specify "should wrap the supplied block in pool.hold" do
@@ -339,9 +339,7 @@ end
 
 context "Database#test_connection" do
   before do
-    @db = Sequel::Database.new
-    @test = nil
-    @db.pool.connection_proc = proc {@test = rand(100)}
+    @db = Sequel::Database.new{@test = rand(100)}
   end
   
   specify "should call pool#hold" do
@@ -593,8 +591,7 @@ end
 
 context "Database#transaction" do
   before do
-    @db = Dummy3Database.new
-    @db.pool.connection_proc = proc {Dummy3Database::DummyConnection.new(@db)}
+    @db = Dummy3Database.new{Dummy3Database::DummyConnection.new(@db)}
   end
   
   specify "should wrap the supplied block with BEGIN + COMMIT statements" do
@@ -659,9 +656,8 @@ end
 
 context "Database#transaction with savepoints" do
   before do
-    @db = Dummy3Database.new
+    @db = Dummy3Database.new{Dummy3Database::DummyConnection.new(@db)}
     @db.meta_def(:supports_savepoints?){true}
-    @db.pool.connection_proc = proc {Dummy3Database::DummyConnection.new(@db)}
   end
   
   specify "should wrap the supplied block with BEGIN + COMMIT statements" do
@@ -825,26 +821,27 @@ context "A Database adapter with a scheme" do
     proc {Sequel.ccc('abc', 'def')}.should raise_error(Sequel::Error)
     
     c = Sequel.ccc('mydb')
+    p = proc{c.opts.delete_if{|k,v| k == :disconnection_proc || k == :single_threaded}}
     c.should be_a_kind_of(CCC)
-    c.opts.should == {:adapter=>:ccc, :database => 'mydb'}
+    p.call.should == {:adapter=>:ccc, :database => 'mydb'}
     
     c = Sequel.ccc('mydb', :host => 'localhost')
     c.should be_a_kind_of(CCC)
-    c.opts.should == {:adapter=>:ccc, :database => 'mydb', :host => 'localhost'}
+    p.call.should == {:adapter=>:ccc, :database => 'mydb', :host => 'localhost'}
     
     c = Sequel.ccc
     c.should be_a_kind_of(CCC)
-    c.opts.should == {:adapter=>:ccc}
+    p.call.should == {:adapter=>:ccc}
     
     c = Sequel.ccc(:database => 'mydb', :host => 'localhost')
     c.should be_a_kind_of(CCC)
-    c.opts.should == {:adapter=>:ccc, :database => 'mydb', :host => 'localhost'}
+    p.call.should == {:adapter=>:ccc, :database => 'mydb', :host => 'localhost'}
   end
   
   specify "should be accessible through Sequel.connect with options" do
     c = Sequel.connect(:adapter => :ccc, :database => 'mydb')
     c.should be_a_kind_of(CCC)
-    c.opts.should == {:adapter => :ccc, :database => 'mydb'}
+    c.opts[:adapter].should == :ccc
   end
 
   specify "should be accessible through Sequel.connect with URL parameters" do
@@ -915,26 +912,26 @@ context "A single threaded database" do
     Sequel::Database.single_threaded = false
   end
   
-  specify "should use a SingleThreadedPool instead of a ConnectionPool" do
-    db = Sequel::Database.new(:single_threaded => true)
-    db.pool.should be_a_kind_of(Sequel::SingleThreadedPool)
+  specify "should use a SingleConnectionPool instead of a ConnectionPool" do
+    db = Sequel::Database.new(:single_threaded => true){123}
+    db.pool.should be_a_kind_of(Sequel::SingleConnectionPool)
   end
   
   specify "should be constructable using :single_threaded => true option" do
-    db = Sequel::Database.new(:single_threaded => true)
-    db.pool.should be_a_kind_of(Sequel::SingleThreadedPool)
+    db = Sequel::Database.new(:single_threaded => true){123}
+    db.pool.should be_a_kind_of(Sequel::SingleConnectionPool)
   end
   
   specify "should be constructable using Database.single_threaded = true" do
     Sequel::Database.single_threaded = true
-    db = Sequel::Database.new
-    db.pool.should be_a_kind_of(Sequel::SingleThreadedPool)
+    db = Sequel::Database.new{123}
+    db.pool.should be_a_kind_of(Sequel::SingleConnectionPool)
   end
 
   specify "should be constructable using Sequel.single_threaded = true" do
     Sequel.single_threaded = true
-    db = Sequel::Database.new
-    db.pool.should be_a_kind_of(Sequel::SingleThreadedPool)
+    db = Sequel::Database.new{123}
+    db.pool.should be_a_kind_of(Sequel::SingleConnectionPool)
   end
 end
 
@@ -951,12 +948,24 @@ context "A single threaded database" do
     @db.pool.hold {|c| c.should == 1234568}
   end
   
-  specify "should convert an Exception into a RuntimeError" do
-    db = Sequel::Database.new(:single_threaded => true) do
-      raise Exception
-    end
-    
-    proc {db.pool.hold {|c|}}.should raise_error(RuntimeError)
+  specify "should disconnect correctly" do
+    def @db.disconnect_connection(c); @dc = c end
+    def @db.dc; @dc end
+    x = nil
+    @db.pool.hold{|c| x = c}
+    @db.pool.hold{|c| c.should == x}
+    proc{@db.disconnect}.should_not raise_error
+    @db.dc.should == x
+  end
+  
+  specify "should convert an Exception on connection into a DatabaseConnectionError" do
+    db = Sequel::Database.new(:single_threaded => true, :servers=>{}){raise Exception}
+    proc {db.pool.hold {|c|}}.should raise_error(Sequel::DatabaseConnectionError)
+  end
+  
+  specify "should raise a DatabaseConnectionError if the connection proc returns nil" do
+    db = Sequel::Database.new(:single_threaded => true, :servers=>{}){nil}
+    proc {db.pool.hold {|c|}}.should raise_error(Sequel::DatabaseConnectionError)
   end
 end
 
@@ -970,7 +979,7 @@ context "A database" do
   end
   
   specify "should have single_threaded? respond to true if in single threaded mode" do
-    db = Sequel::Database.new(:single_threaded => true)
+    db = Sequel::Database.new(:single_threaded => true){1234}
     db.should be_single_threaded
     
     db = Sequel::Database.new(:max_options => 1)
@@ -981,10 +990,10 @@ context "A database" do
     
     Sequel::Database.single_threaded = true
     
-    db = Sequel::Database.new
+    db = Sequel::Database.new{123}
     db.should be_single_threaded
     
-    db = Sequel::Database.new(:max_options => 4)
+    db = Sequel::Database.new(:max_options => 4){123}
     db.should be_single_threaded
   end
   
@@ -1208,22 +1217,22 @@ end
 context "Database#server_opts" do
   specify "should return the general opts if no :servers option is used" do
     opts = {:host=>1, :database=>2}
-    MockDatabase.new(opts).send(:server_opts, :server1).should == {:host=>1, :database=>2}
+    MockDatabase.new(opts).send(:server_opts, :server1)[:host].should == 1
   end
   
   specify "should return the general opts if entry for the server is present in the :servers option" do
     opts = {:host=>1, :database=>2, :servers=>{}}
-    MockDatabase.new(opts).send(:server_opts, :server1).should == {:host=>1, :database=>2}
+    MockDatabase.new(opts).send(:server_opts, :server1)[:host].should == 1
   end
   
   specify "should return the general opts merged with the specific opts if given as a hash" do
     opts = {:host=>1, :database=>2, :servers=>{:server1=>{:host=>3}}}
-    MockDatabase.new(opts).send(:server_opts, :server1).should == {:host=>3, :database=>2}
+    MockDatabase.new(opts).send(:server_opts, :server1)[:host].should == 3
   end
   
   specify "should return the sgeneral opts merged with the specific opts if given as a proc" do
     opts = {:host=>1, :database=>2, :servers=>{:server1=>proc{|db| {:host=>4}}}}
-    MockDatabase.new(opts).send(:server_opts, :server1).should == {:host=>4, :database=>2}
+    MockDatabase.new(opts).send(:server_opts, :server1)[:host].should == 4
   end
   
   specify "should raise an error if the specific opts is not a proc or hash" do
@@ -1232,6 +1241,140 @@ context "Database#server_opts" do
   end
 end
 
+context "Database#add_servers" do
+  before do
+    @db = MockDatabase.new(:host=>1, :database=>2, :servers=>{:server1=>{:host=>3}})
+    def @db.connect(server)
+      server_opts(server)
+    end
+    def @db.disconnect_connection(c)
+    end
+  end
+
+  specify "should add new servers to the connection pool" do
+    @db.synchronize{|c| c[:host].should == 1}
+    @db.synchronize(:server1){|c| c[:host].should == 3}
+    @db.synchronize(:server2){|c| c[:host].should == 1}
+
+    @db.add_servers(:server2=>{:host=>6})
+    @db.synchronize{|c| c[:host].should == 1}
+    @db.synchronize(:server1){|c| c[:host].should == 3}
+    @db.synchronize(:server2){|c| c[:host].should == 6}
+
+    @db.disconnect
+    @db.synchronize{|c| c[:host].should == 1}
+    @db.synchronize(:server1){|c| c[:host].should == 3}
+    @db.synchronize(:server2){|c| c[:host].should == 6}
+  end
+
+  specify "should replace options for future connections to existing servers" do
+    @db.synchronize{|c| c[:host].should == 1}
+    @db.synchronize(:server1){|c| c[:host].should == 3}
+    @db.synchronize(:server2){|c| c[:host].should == 1}
+
+    @db.add_servers(:default=>proc{{:host=>4}}, :server1=>{:host=>8})
+    @db.synchronize{|c| c[:host].should == 1}
+    @db.synchronize(:server1){|c| c[:host].should == 3}
+    @db.synchronize(:server2){|c| c[:host].should == 1}
+
+    @db.disconnect
+    @db.synchronize{|c| c[:host].should == 4}
+    @db.synchronize(:server1){|c| c[:host].should == 8}
+    @db.synchronize(:server2){|c| c[:host].should == 4}
+  end
+end
+
+context "Database#remove_servers" do
+  before do
+    @db = MockDatabase.new(:host=>1, :database=>2, :servers=>{:server1=>{:host=>3}, :server2=>{:host=>4}})
+    def @db.connect(server)
+      server_opts(server)
+    end
+    def @db.disconnect_connection(c)
+    end
+  end
+
+  specify "should remove servers from the connection pool" do
+    @db.synchronize{|c| c[:host].should == 1}
+    @db.synchronize(:server1){|c| c[:host].should == 3}
+    @db.synchronize(:server2){|c| c[:host].should == 4}
+
+    @db.remove_servers(:server1, :server2)
+    @db.synchronize{|c| c[:host].should == 1}
+    @db.synchronize(:server1){|c| c[:host].should == 1}
+    @db.synchronize(:server2){|c| c[:host].should == 1}
+  end
+  
+  specify "should accept arrays of symbols" do
+    @db.remove_servers([:server1, :server2])
+    @db.synchronize{|c| c[:host].should == 1}
+    @db.synchronize(:server1){|c| c[:host].should == 1}
+    @db.synchronize(:server2){|c| c[:host].should == 1}
+  end
+
+  specify "should allow removal while connections are still open" do
+    @db.synchronize do |c1|
+      c1[:host].should == 1
+      @db.synchronize(:server1) do |c2|
+        c2[:host].should == 3
+        @db.synchronize(:server2) do |c3|
+          c3[:host].should == 4
+          @db.remove_servers(:server1, :server2)
+            @db.synchronize(:server1) do |c4|
+              c4.should_not == c2
+              c4.should == c1
+              c4[:host].should == 1
+              @db.synchronize(:server2) do |c5|
+                c5.should_not == c3
+                c5.should == c1
+                c5[:host].should == 1
+              end
+            end
+          c3[:host].should == 4
+         end
+        c2[:host].should == 3
+      end
+      c1[:host].should == 1
+    end
+  end
+end
+
+context "Database#each_server" do
+  before do
+    @db = Sequel.connect(:adapter=>:mock, :host=>1, :database=>2, :servers=>{:server1=>{:host=>3}, :server2=>{:host=>4}})
+    def @db.connect(server)
+      server_opts(server)
+    end
+    def @db.disconnect_connection(c)
+    end
+  end
+
+  specify "should yield a separate database object for each server" do
+    hosts = []
+    @db.each_server do |db|
+      db.should be_a_kind_of(Sequel::Database)
+      db.should_not == @db
+      db.opts[:database].should == 2
+      hosts << db.opts[:host]
+    end
+    hosts.sort.should == [1, 3, 4]
+  end
+
+  specify "should disconnect and remove entry from Sequel::DATABASES after use" do
+    dbs = []
+    dcs = []
+    @db.each_server do |db|
+      dbs << db
+      Sequel::DATABASES.should include(db)
+      db.meta_def(:disconnect){dcs << db}
+    end
+    dbs.each do |db|
+      Sequel::DATABASES.should_not include(db)
+    end
+    dbs.should == dcs
+  end
+end
+  
 context "Database#raise_error" do
   specify "should reraise if the exception class is not in opts[:classes]" do
     e = Class.new(StandardError)
